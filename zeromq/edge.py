@@ -4,6 +4,9 @@ import os
 import sys
 import struct
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def send_file(server_ip, port, filepath):
@@ -12,10 +15,17 @@ def send_file(server_ip, port, filepath):
     filename = os.path.basename(filepath)
     filesize = os.path.getsize(filepath)
     
-    print(f"[CLIENT] Connecting to {server_ip}:{port}")
+    
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((server_ip, port))
-    print(f"[CLIENT] Connected")
+
+    while True:
+        try:
+            sock.connect((server_ip, port))
+            print("[CLIENT] Connected")
+            break
+        except ConnectionRefusedError:
+            print("[CLIENT] Server not ready, retrying...")
+            time.sleep(2)
     
     # Send filename length + filename + filesize
     name_bytes = filename.encode()
@@ -98,6 +108,7 @@ def recv_exact(sock, n):
             raise ConnectionError("Connection closed")
         data += chunk
     return data
+
 
 
 PORT = 9999
