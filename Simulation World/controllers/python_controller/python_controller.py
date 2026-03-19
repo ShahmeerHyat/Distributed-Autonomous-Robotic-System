@@ -1,12 +1,10 @@
 from controller import Robot
-from PIL import Image
-import zmq
-import msgpack
-import io
-import numpy as np
-from ultralytics import YOLO
-import cv2
-print("Script Starte")
+import socket
+import pickle
+import struct
+import time
+import os
+
 # ---------------------------
 # Initialize Robot & Devices
 # ---------------------------
@@ -14,7 +12,7 @@ robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 
 # ----- Motors -----
-left_motor = robot.getDevice("left wheel motor")
+left_motor  = robot.getDevice("left wheel motor")
 right_motor = robot.getDevice("right wheel motor")
 left_motor.setPosition(float('inf'))
 right_motor.setPosition(float('inf'))
@@ -24,93 +22,114 @@ MAX_SPEED = 6.28
 camera = robot.getDevice("camera")
 camera.enable(timestep)
 
-# ----- Distance Sensors (optional) -----
+# ----- Distance Sensors -----
 proximity = []
 for i in range(8):
     ps = robot.getDevice(f"ps{i}")
     ps.enable(timestep)
     proximity.append(ps)
 
-# ---------------------------
-# Initialize ZMQ Publisher
-# ---------------------------
-ctx = zmq.Context()
-sock = ctx.socket(zmq.PUB)
-sock.bind("tcp://*:5555")
+print("[EDGE] Robot and devices initialized.")
 
-print("[INFO] Python controller initialized.")
 
 # ---------------------------
-# Initialize YOLO
+# Socket Helpers
 # ---------------------------
-yolo_model = YOLO("yolov8n.pt")  # make sure model is in controller folder
+def recv_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def send_object(sock, obj):
+    payload = pickle.dumps(obj)
+    header  = struct.pack('!Q', len(payload))
+    sock.sendall(header + payload)
+
+
+def recv_object(sock):
+    header = recv_exact(sock, 8)
+    if not header:
+        return None
+    size    = struct.unpack('!Q', header)[0]
+    payload = recv_exact(sock, size)
+    if not payload:
+        return None
+    return pickle.loads(payload)
+
 
 # ---------------------------
-# Movement State Variables
+# Connect to Server (with retry)
 # ---------------------------
-state = "forward"
-counter = 0
+SERVER_IP   = os.getenv("SERVER_IP")
+SERVER_PORT = 9999
+
+def connect_to_server(ip, port):
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((ip, port))
+            print(f"[EDGE] Connected to server {ip}:{port}")
+            return s
+        except Exception as e:
+            print(f"[EDGE] Connection failed: {e} — retrying in 2s...")
+            time.sleep(2)
+
+sock = connect_to_server(SERVER_IP, SERVER_PORT)
+
+print("[EDGE] Starting main loop...")
+
 
 # ---------------------------
 # Main Loop
 # ---------------------------
 while robot.step(timestep) != -1:
 
-    # ---------- CAMERA ----------
+    # ---------- CAPTURE FRAME ----------
     raw_image = camera.getImage()
-    width = camera.getWidth()
-    height = camera.getHeight()
+    width     = camera.getWidth()
+    height    = camera.getHeight()
 
-    if raw_image:
-        # Convert BGRA bytes to Pillow Image
-        img = Image.frombytes("RGBA", (width, height), raw_image, "raw", "BGRA")
+    if not raw_image:
+        continue
 
-        # ---------- YOLO DETECTION ----------
-        results = np.array(img.convert("RGB"))
-        # results = yolo_model(frame)
-        annotated = results[0].plot()  # annotated NumPy array
+    # ---------- SEND RAW IMAGE TO SERVER ----------
+    payload = {
+        'image' : raw_image,   # raw BGRA bytes from Webots camera
+        'width' : width,
+        'height': height,
+    }
 
-        # Convert annotated NumPy array to JPEG bytes
-        annotated_img = Image.fromarray(annotated)
-        buf = io.BytesIO()
-        annotated_img.save(buf, format="JPEG")
+    try:
+        send_object(sock, payload)
+    except Exception as e:
+        print(f"[EDGE] Send failed: {e} — reconnecting...")
+        sock = connect_to_server(SERVER_IP, SERVER_PORT)
+        continue
 
-        payload = {
-            "time": robot.getTime(),
-            "data": buf.getvalue()
-        }
+    # ---------- RECEIVE DETECTIONS BACK ----------
+    try:
+        response = recv_object(sock)
+    except Exception as e:
+        print(f"[EDGE] Receive failed: {e} — reconnecting...")
+        sock = connect_to_server(SERVER_IP, SERVER_PORT)
+        continue
 
-        # Send annotated frame to external server
-        sock.send(msgpack.packb(payload, use_bin_type=True))
+    if response is None:
+        print("[EDGE] Empty response — reconnecting...")
+        sock = connect_to_server(SERVER_IP, SERVER_PORT)
+        continue
 
-        # ---------- ROBOT REACTION TO DETECTION ----------
-        detected_classes = results[0].names
-        detected_labels = [detected_classes[int(cls)] for cls in results[0].boxes.cls] if len(results[0].boxes) > 0 else []
-        # Example reaction: slow down if a "person" detected
-        if "person" in detected_labels:
-            left_motor.setVelocity(0.2 * MAX_SPEED)
-            right_motor.setVelocity(0.2 * MAX_SPEED)
-        else:
-            # ---------- OBSTACLE AVOIDANCE ----------
-            sensor_values = [ps.getValue() for ps in proximity]
-            obstacle = max(sensor_values) > 80  # threshold
+    # ---------- USE DETECTIONS ----------
+    detected_labels = response.get('detections', [])
 
-            if obstacle:
-                left_motor.setVelocity(0.5 * MAX_SPEED)
-                right_motor.setVelocity(-0.5 * MAX_SPEED)
-            else:
-                # ---------- FIXED PATH ----------
-                if state == "forward":
-                    left_motor.setVelocity(0.5 * MAX_SPEED)
-                    right_motor.setVelocity(0.5 * MAX_SPEED)
-                    counter += 1
-                    if counter > 100:
-                        state = "turn"
-                        counter = 0
-                elif state == "turn":
-                    left_motor.setVelocity(0.5 * MAX_SPEED)
-                    right_motor.setVelocity(-0.5 * MAX_SPEED)
-                    counter += 1
-                    if counter > 40:
-                        state = "forward"
-                        counter = 0
+    if detected_labels:
+        print(f"[EDGE] Detected: {detected_labels}")
+    else:
+        print("[EDGE] Nothing detected")
+
+    # Movement logic goes here later
