@@ -83,6 +83,17 @@ sock = connect_to_server(SERVER_IP, SERVER_PORT)
 
 print("[EDGE] Starting main loop...")
 
+# ---------------------------
+# Metrics Tracking
+# ---------------------------
+capture_times = []
+send_times    = []
+recv_times    = []
+total_times   = []
+
+BENCHMARK_DURATION = 10.0   # seconds to collect metrics
+benchmark_start    = time.perf_counter()
+benchmarking       = True
 
 # ---------------------------
 # Main Loop
@@ -90,6 +101,8 @@ print("[EDGE] Starting main loop...")
 while robot.step(timestep) != -1:
 
     # ---------- CAPTURE FRAME ----------
+    t_capture_start = time.perf_counter()
+
     raw_image = camera.getImage()
     width     = camera.getWidth()
     height    = camera.getHeight()
@@ -97,12 +110,16 @@ while robot.step(timestep) != -1:
     if not raw_image:
         continue
 
+    t_capture_end = time.perf_counter()   # pure capture time isolated
+
     # ---------- SEND RAW IMAGE TO SERVER ----------
     payload = {
-        'image' : raw_image,   # raw BGRA bytes from Webots camera
+        'image' : raw_image,
         'width' : width,
         'height': height,
     }
+
+    t0 = time.perf_counter()              # pure send starts here
 
     try:
         send_object(sock, payload)
@@ -111,6 +128,8 @@ while robot.step(timestep) != -1:
         sock = connect_to_server(SERVER_IP, SERVER_PORT)
         continue
 
+    t1 = time.perf_counter()             # pure send ends here
+
     # ---------- RECEIVE DETECTIONS BACK ----------
     try:
         response = recv_object(sock)
@@ -118,6 +137,8 @@ while robot.step(timestep) != -1:
         print(f"[EDGE] Receive failed: {e} — reconnecting...")
         sock = connect_to_server(SERVER_IP, SERVER_PORT)
         continue
+
+    t2 = time.perf_counter()             # recv ends here
 
     if response is None:
         print("[EDGE] Empty response — reconnecting...")
@@ -133,3 +154,37 @@ while robot.step(timestep) != -1:
         print("[EDGE] Nothing detected")
 
     # Movement logic goes here later
+
+    # ---------- COMPUTE & LOG TIMINGS ----------
+    capture_ms = (t_capture_end - t_capture_start) * 1000
+    send_ms    = (t1 - t0) * 1000
+    recv_ms    = (t2 - t1) * 1000
+    total_ms   = (t_capture_end - t_capture_start + t1 - t0 + t2 - t1) * 1000
+
+    # print(f"Capture: {capture_ms:.1f}ms | Send: {send_ms:.1f}ms | Recv: {recv_ms:.1f}ms | Total: {total_ms:.1f}ms")
+
+    # ---------- ACCUMULATE FOR BENCHMARK ----------
+    if benchmarking:
+        capture_times.append(capture_ms)
+        send_times.append(send_ms)
+        recv_times.append(recv_ms)
+        total_times.append(total_ms)
+
+        elapsed = time.perf_counter() - benchmark_start
+        if elapsed >= BENCHMARK_DURATION:
+            benchmarking = False
+
+n = len(total_times)
+print("\n" + "=" * 55)
+print(f"  BENCHMARK RESULTS — {BENCHMARK_DURATION:.0f}s | {n} frames | {n/elapsed:.1f} FPS")
+print("=" * 55)
+print(f"  {'Metric':<10} {'Min':>8} {'Max':>8} {'Avg':>8}")
+print("-" * 55)
+for label, data in [
+    ("Capture",  capture_times),
+    ("Send",     send_times),
+    ("Recv",     recv_times),
+    ("Total",    total_times),
+]:
+    print(f"  {label:<10} {min(data):>7.1f}ms {max(data):>7.1f}ms {sum(data)/n:>7.1f}ms")
+print("=" * 55 + "\n")
