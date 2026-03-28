@@ -1,9 +1,7 @@
-from controller import Robot
-import socket
-import pickle
-import struct
+from controller import Robot    # type: ignore
+import numpy as np
+from ultralytics import YOLO
 import time
-import os
 
 # ---------------------------
 # Initialize Robot & Devices
@@ -31,78 +29,79 @@ for i in range(8):
 
 print("[EDGE] Robot and devices initialized.")
 
+# ---------------------------
+# Load YOLO once before loop
+# ---------------------------
+print("[EDGE] Loading YOLO model...")
+yolo_model = YOLO("yolov8n.pt")  # Nano model is perfect for CPU
+print("[EDGE] YOLO model loaded.")
 
 # ---------------------------
-# Socket Helpers
+# CPU Optimization Settings
 # ---------------------------
-def recv_exact(sock, n):
-    data = b''
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return data
-
-
-def send_object(sock, obj):
-    payload = pickle.dumps(obj)
-    header  = struct.pack('!Q', len(payload))
-    sock.sendall(header + payload)
-
-
-def recv_object(sock):
-    header = recv_exact(sock, 8)
-    if not header:
-        return None
-    size    = struct.unpack('!Q', header)[0]
-    payload = recv_exact(sock, size)
-    if not payload:
-        return None
-    return pickle.loads(payload)
-
-
-# ---------------------------
-# Connect to Server (with retry)
-# ---------------------------
-SERVER_IP   = os.getenv("SERVER_IP")
-SERVER_PORT = 9999
-
-def connect_to_server(ip, port):
-    while True:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((ip, port))
-            print(f"[EDGE] Connected to server {ip}:{port}")
-            return s
-        except Exception as e:
-            print(f"[EDGE] Connection failed: {e} — retrying in 2s...")
-            time.sleep(2)
-
-sock = connect_to_server(SERVER_IP, SERVER_PORT)
-
-print("[EDGE] Starting main loop...")
+INFER_EVERY_N_FRAMES = 3   # YOLO only runs 1 out of every 3 frames
+YOLO_RESOLUTION = 320      # Cut resolution in half (Default is 640)
 
 # ---------------------------
 # Metrics Tracking
 # ---------------------------
-capture_times = []
-send_times    = []
-recv_times    = []
-total_times   = []
+capture_times     = []
+preprocess_times  = []
+inference_times   = []
+total_times       = []
 
-BENCHMARK_DURATION = 10.0   # seconds to collect metrics
-benchmark_start    = time.perf_counter()
-benchmarking       = True
+session_start = time.perf_counter()
+
+# ---------------------------
+# Print Benchmark Summary
+# ---------------------------
+def print_benchmark():
+    n_total = len(total_times)
+    n_infer = len(inference_times)
+    
+    if n_total == 0:
+        print("[EDGE] No frames processed — nothing to report.")
+        return
+        
+    session_duration = time.perf_counter() - session_start
+
+    print("\n" + "=" * 65)
+    print(f"  BENCHMARK RESULTS — {session_duration:.1f}s | {n_total} frames | {n_total/session_duration:.1f} Effective FPS")
+    print("=" * 65)
+    print(f"  {'Metric':<14} {'Min':>8} {'Max':>8} {'Avg':>8}")
+    print("-" * 65)
+    
+    # Safely calculate averages
+    avg_cap = sum(capture_times)/len(capture_times) if capture_times else 0
+    avg_pre = sum(preprocess_times)/len(preprocess_times) if preprocess_times else 0
+    avg_inf = sum(inference_times)/n_infer if n_infer > 0 else 0
+    avg_tot = sum(total_times)/n_total if total_times else 0
+
+    print(f"  {'Capture':<14} {min(capture_times, default=0):>7.1f}ms {max(capture_times, default=0):>7.1f}ms {avg_cap:>7.1f}ms")
+    print(f"  {'Preprocess':<14} {min(preprocess_times, default=0):>7.1f}ms {max(preprocess_times, default=0):>7.1f}ms {avg_pre:>7.1f}ms")
+    print(f"  {'Inference*':<14} {min(inference_times, default=0):>7.1f}ms {max(inference_times, default=0):>7.1f}ms {avg_inf:>7.1f}ms")
+    print(f"  {'Total/Frame':<14} {min(total_times, default=0):>7.1f}ms {max(total_times, default=0):>7.1f}ms {avg_tot:>7.1f}ms")
+    print("-" * 65)
+    print(f"  *Inference ran on {n_infer} out of {n_total} frames (every {INFER_EVERY_N_FRAMES} frames)")
+    print("=" * 65 + "\n")
 
 # ---------------------------
 # Main Loop
 # ---------------------------
+print("[EDGE] Starting main loop...")
+frame_count = 0
+last_detected_labels = []
+
 while robot.step(timestep) != -1:
+
+    if frame_count >= 500:
+        break
+        
+    t_frame_start = time.perf_counter()
+    frame_count += 1
 
     # ---------- CAPTURE FRAME ----------
     t_capture_start = time.perf_counter()
-
     raw_image = camera.getImage()
     width     = camera.getWidth()
     height    = camera.getHeight()
@@ -110,81 +109,53 @@ while robot.step(timestep) != -1:
     if not raw_image:
         continue
 
-    t_capture_end = time.perf_counter()   # pure capture time isolated
+    t_capture_end = time.perf_counter()
 
-    # ---------- SEND RAW IMAGE TO SERVER ----------
-    payload = {
-        'image' : raw_image,
-        'width' : width,
-        'height': height,
-    }
+    # ---------- PREPROCESS ----------
+    t_pre_start = time.perf_counter()
 
-    t0 = time.perf_counter()              # pure send starts here
+    frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 4))
+    # CPU Optimization: Single-pass slice to drop alpha (4th channel) and reverse BGR to RGB
+    frame = np.ascontiguousarray(frame[:, :, 2::-1]) 
 
-    try:
-        send_object(sock, payload)
-    except Exception as e:
-        print(f"[EDGE] Send failed: {e} — reconnecting...")
-        sock = connect_to_server(SERVER_IP, SERVER_PORT)
-        continue
+    t_pre_end = time.perf_counter()
 
-    t1 = time.perf_counter()             # pure send ends here
+    # ---------- RUN YOLO (CPU OPTIMIZED) ----------
+    inference_ms = 0  # Default to 0 for skipped frames
+    
+    if frame_count % INFER_EVERY_N_FRAMES == 0:
+        t_infer_start = time.perf_counter()
 
-    # ---------- RECEIVE DETECTIONS BACK ----------
-    try:
-        response = recv_object(sock)
-    except Exception as e:
-        print(f"[EDGE] Receive failed: {e} — reconnecting...")
-        sock = connect_to_server(SERVER_IP, SERVER_PORT)
-        continue
+        try:
+            # CPU Optimization: Lower imgsz dramatically reduces CPU load
+            results         = yolo_model(frame, verbose=False, imgsz=YOLO_RESOLUTION)
+            boxes           = results[0].boxes
+            class_names     = results[0].names
+            last_detected_labels = [class_names[int(cls)] for cls in boxes.cls] if len(boxes) > 0 else []
+        except Exception as e:
+            print(f"[EDGE] YOLO error: {e}")
+            last_detected_labels = []
 
-    t2 = time.perf_counter()             # recv ends here
+        t_infer_end = time.perf_counter()
+        inference_ms = (t_infer_end - t_infer_start) * 1000
+        inference_times.append(inference_ms)
 
-    if response is None:
-        print("[EDGE] Empty response — reconnecting...")
-        sock = connect_to_server(SERVER_IP, SERVER_PORT)
-        continue
+    # Use the cached labels on skipped frames
+    detected_labels = last_detected_labels
 
     # ---------- USE DETECTIONS ----------
-    detected_labels = response.get('detections', [])
+    # Uncomment to see detections spam:
+    # if detected_labels:
+    #     print(f"[EDGE] Detected: {detected_labels}")
 
-    if detected_labels:
-        print(f"[EDGE] Detected: {detected_labels}")
-    else:
-        print("[EDGE] Nothing detected")
+    # # ---------- COMPUTE & LOG TIMINGS ----------
+    capture_ms    = (t_capture_end - t_capture_start) * 1000
+    preprocess_ms = (t_pre_end     - t_pre_start)     * 1000
+    total_ms      = (time.perf_counter() - t_frame_start) * 1000
 
-    # Movement logic goes here later
+    capture_times.append(capture_ms)
+    preprocess_times.append(preprocess_ms)
+    total_times.append(total_ms)
 
-    # ---------- COMPUTE & LOG TIMINGS ----------
-    capture_ms = (t_capture_end - t_capture_start) * 1000
-    send_ms    = (t1 - t0) * 1000
-    recv_ms    = (t2 - t1) * 1000
-    total_ms   = (t_capture_end - t_capture_start + t1 - t0 + t2 - t1) * 1000
-
-    # print(f"Capture: {capture_ms:.1f}ms | Send: {send_ms:.1f}ms | Recv: {recv_ms:.1f}ms | Total: {total_ms:.1f}ms")
-
-    # ---------- ACCUMULATE FOR BENCHMARK ----------
-    if benchmarking:
-        capture_times.append(capture_ms)
-        send_times.append(send_ms)
-        recv_times.append(recv_ms)
-        total_times.append(total_ms)
-
-        elapsed = time.perf_counter() - benchmark_start
-        if elapsed >= BENCHMARK_DURATION:
-            benchmarking = False
-
-n = len(total_times)
-print("\n" + "=" * 55)
-print(f"  BENCHMARK RESULTS — {BENCHMARK_DURATION:.0f}s | {n} frames | {n/elapsed:.1f} FPS")
-print("=" * 55)
-print(f"  {'Metric':<10} {'Min':>8} {'Max':>8} {'Avg':>8}")
-print("-" * 55)
-for label, data in [
-    ("Capture",  capture_times),
-    ("Send",     send_times),
-    ("Recv",     recv_times),
-    ("Total",    total_times),
-]:
-    print(f"  {label:<10} {min(data):>7.1f}ms {max(data):>7.1f}ms {sum(data)/n:>7.1f}ms")
-print("=" * 55 + "\n")
+# Loop exited — simulation stopped
+print_benchmark()
