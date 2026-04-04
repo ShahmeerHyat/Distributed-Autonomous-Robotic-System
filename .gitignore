@@ -3,3 +3,5 @@
 /runs
 /Simulation World/
 /zeromq/
+/spvit_venv/
+__pycache__

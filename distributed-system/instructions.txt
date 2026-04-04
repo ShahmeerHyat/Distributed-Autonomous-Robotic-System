@@ -1,2 +1,4 @@
-python worker.py --name laptop_cpu --rank 2 --master_ip [PROBOOK_IP] --cpu.
+# Listen on all network interfaces (0.0.0.0) on port 29500 and enable GPU
+python worker.py --name pc_gpu --master_ip 192.168.1.10
 
+python master.py
