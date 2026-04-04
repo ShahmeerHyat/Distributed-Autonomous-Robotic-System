@@ -15,7 +15,7 @@ from shared_utils import (
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-PREFLIGHT_PINGS    = 4      # number of RTT samples taken before block 0
+PREFLIGHT_PINGS    = 8      # number of RTT samples taken before block 0
 PROBE_FAIL_LATENCY = 999.0  # sentinel used when a probe dispatch fails
 
 
