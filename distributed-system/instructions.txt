@@ -1,0 +1,2 @@
+python worker.py --name laptop_cpu --rank 2 --master_ip [PROBOOK_IP] --cpu.
+
