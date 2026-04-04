@@ -1,3 +1,5 @@
 /yolo_venv/
 *.pt
 /runs
+/Simulation World/
+/zeromq/
