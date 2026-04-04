@@ -73,8 +73,9 @@ def ready_for_math(t, meta):
 
 # --- Advanced ARIMA-V Manager ---
 class MultiDeviceARIMAManager:
-    def __init__(self, device_ids, p=3, d=1, q=1):
+    def __init__(self, device_ids, p=3, d=1, q=1, min_share_threshold=0.05):
         self.p, self.d, self.q = p, d, q
+        self.min_share_threshold = min_share_threshold
         self.devices = device_ids
         self.history = {dev: [] for dev in device_ids}
         self.residuals = {dev: [] for dev in device_ids}
@@ -102,13 +103,45 @@ class MultiDeviceARIMAManager:
 
     def update_shares(self):
         predictions = {dev: self._predict_device_latency(dev) for dev in self.devices}
+        
+        # The Edge device is our baseline. It represents the "guaranteed" local speed.
+        edge_pred = predictions.get('edge', 0.1) 
+        
+        # If a network worker is predicted to take X times longer than the Edge device,
+        # it has become a severe bottleneck. Cut it off so the system doesn't wait.
+        LATENCY_BOTTLENECK_MULTIPLIER = 3.0 
+        
         scores = {dev: 1.0 / pred for dev, pred in predictions.items()}
         total_score = sum(scores.values())
+        
+        # 1. Calculate raw mathematical shares
+        raw_shares = {dev: scores[dev] / total_score for dev in self.devices}
+        
+        # 2. Apply Latency & Payload Thresholding
+        valid_scores = {}
         for dev in self.devices:
-            if self.history[dev][-1] >= 10:
+            if dev == 'edge':
+                valid_scores[dev] = scores[dev]
+                continue
+            
+            # Check 1: Is the predicted latency absurdly high? (Network Stutter)
+            if predictions[dev] > (edge_pred * LATENCY_BOTTLENECK_MULTIPLIER):
                 self.current_shares[dev] = 0.0
+                print(f"\n[ARIMA-V] ⚠️ Dropped '{dev}'. Predicted latency ({predictions[dev]:.3f}s) is too slow compared to local edge ({edge_pred:.3f}s).")
+            
+            # Check 2: Is the payload mathematically too small to justify serialization?
+            elif raw_shares[dev] < self.min_share_threshold:
+                self.current_shares[dev] = 0.0
+                print(f"\n[ARIMA-V] ⚠️ Dropped '{dev}'. Payload share ({raw_shares[dev]*100:.1f}%) is too small to overcome TCP overhead.")
+                
             else:
-                self.current_shares[dev] = scores[dev] / total_score
+                valid_scores[dev] = scores[dev]
+                
+        # 3. Re-normalize shares among the surviving, healthy devices
+        new_total = sum(valid_scores.values())
+        for dev in valid_scores:
+            self.current_shares[dev] = valid_scores[dev] / new_total
+            
         return self.current_shares
 
     def get_indices(self, dev, total_items):
