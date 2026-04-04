@@ -105,7 +105,10 @@ class MultiDeviceARIMAManager:
         scores = {dev: 1.0 / pred for dev, pred in predictions.items()}
         total_score = sum(scores.values())
         for dev in self.devices:
-            self.current_shares[dev] = scores[dev] / total_score
+            if self.history[dev][-1] >= 10:
+                self.current_shares[dev] = 0.0
+            else:
+                self.current_shares[dev] = scores[dev] / total_score
         return self.current_shares
 
     def get_indices(self, dev, total_items):
