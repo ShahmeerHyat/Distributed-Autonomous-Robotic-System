@@ -36,15 +36,22 @@ class MasterOrchestrator:
         server_socket.close()
 
     def _dispatch_task(self, w_name, task_type, block_idx, x, start_idx, end_idx):
+        """Dispatches the task and returns (result, latency_in_seconds)"""
+        start_t = time.time()
         sock = self.sockets[w_name]
         send_msg(sock, (task_type, block_idx, x, start_idx, end_idx))
-        return recv_msg(sock)
+        res = recv_msg(sock)
+        # Latency = Transmission Time + Computation Time + Return Time
+        latency = time.time() - start_t
+        return res, latency
 
     def run_inference(self, x):
         current_state = x
         
         for i, block in enumerate(self.model.encoder.layers):
-            start_block_time = time.time()
+            # Track individual device times for this specific block
+            device_latencies = {dev: 0.0 for dev in self.all_devices}
+            
             self.arima.update_shares()
             
             # --- PHASE 1: ATTENTION ---
@@ -62,6 +69,7 @@ class MasterOrchestrator:
 
             # 2. Local Edge Attn
             edge_h = self.arima.get_indices('edge', self.meta["num_heads"])
+            edge_start_t = time.time()  # Start timing edge
             if len(edge_h) > 0:
                 edge_attn_w = get_head_weights(
                     block.self_attention.in_proj_weight, edge_h, 
@@ -70,6 +78,8 @@ class MasterOrchestrator:
                 edge_qkv = ln_x @ edge_attn_w.t()
             else:
                 edge_qkv = torch.tensor([])
+            # Add edge compute time for ATTN
+            device_latencies['edge'] += (time.time() - edge_start_t)
 
             # 3. Collect & Merge (Strictly in device order)
             qkv_parts = []
@@ -77,11 +87,13 @@ class MasterOrchestrator:
                 if dev == 'edge': 
                     qkv_parts.append(edge_qkv)
                 elif dev in attn_futures:
-                    qkv_parts.append(attn_futures[dev].result())
+                    res, latency = attn_futures[dev].result() # Unpack result and time
+                    qkv_parts.append(res)
+                    device_latencies[dev] += latency      # Add worker time for ATTN
             
             merged_qkv = merge_n_projections(qkv_parts)
             
-            # 4. Notebook: Add Bias & Global Softmax
+            # 4. Global Softmax
             merged_qkv = merged_qkv + block.self_attention.in_proj_bias
             q, k, v = torch.chunk(merged_qkv, 3, dim=-1)
             
@@ -112,6 +124,7 @@ class MasterOrchestrator:
             
             # 2. Local Edge MLP
             edge_n = self.arima.get_indices('edge', self.meta["mlp_hidden_dim"])
+            edge_start_t = time.time() # Start timing edge
             if len(edge_n) > 0:
                 w1 = block.mlp[0].weight[edge_n.start:edge_n.stop, :]
                 b1 = block.mlp[0].bias[edge_n.start:edge_n.stop]
@@ -119,22 +132,28 @@ class MasterOrchestrator:
                 edge_mlp = torch.nn.functional.gelu(ln_x_mlp @ w1.t() + b1) @ w2.t()
             else:
                 edge_mlp = torch.tensor([])
+            # Add edge compute time for MLP
+            device_latencies['edge'] += (time.time() - edge_start_t)
 
             # 3. Collect & Sum (ONS Logic)
             mlp_parts = [edge_mlp] if edge_mlp.numel() > 0 else []
-            for f in mlp_futures.values():
-                res = f.result()
-                if res.numel() > 0: mlp_parts.append(res)
+            for w_name, f in mlp_futures.items():
+                res, latency = f.result() # Unpack result and time
+                if res.numel() > 0: 
+                    mlp_parts.append(res)
+                device_latencies[w_name] += latency   # Add worker time for MLP
             
             mlp_final = torch.sum(torch.stack(mlp_parts), dim=0) + block.mlp[3].bias
             current_state = identity + mlp_final
 
-            # Record total loop time for ARIMA
-            block_time = time.time() - start_block_time
+            # --- DYNAMIC UPDATE STEP ---
+            # Record the accumulated latencies to the ARIMA manager independently
             for dev in self.all_devices:
-                self.arima.record_block_latency(dev, block_time)
+                self.arima.record_block_latency(dev, device_latencies[dev])
             
-            print(f"Block {i} completed. Attn Heads: [Edge: {len(edge_h)} | GPU: {sum([len(self.arima.get_indices(w, self.meta['num_heads'])) for w in self.expected_workers])}]")
+            # Formatted printing to see how fast each device was
+            timings = " | ".join([f"{d}: {device_latencies[d]:.4f}s" for d in self.all_devices])
+            print(f"Block {i} completed. Attn Heads: [Edge: {len(edge_h)} | GPU: {sum([len(self.arima.get_indices(w, self.meta['num_heads'])) for w in self.expected_workers])}] -> {timings}")
 
         return current_state
 
@@ -153,5 +172,5 @@ if __name__ == "__main__":
     
     start_t = time.time()
     output = orch.run_inference(dummy_input)
-    print(f"Inference Successful in {time.time() - start_t:.4f} seconds.")
+    print(f"\nInference Successful in {time.time() - start_t:.4f} seconds.")
     orch.shutdown()
