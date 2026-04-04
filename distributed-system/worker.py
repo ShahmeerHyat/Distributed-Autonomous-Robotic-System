@@ -27,6 +27,7 @@ class ViTWorker:
             ).to(self.device)
             
             # NO BIAS HERE. Just raw linear projection to be merged by Master.
+            print(f"Computed Attention Slice Dimension: {(x @ attn_w.t()).shape}")
             return (x @ attn_w.t()).cpu()
 
     def compute_mlp_slice(self, block_idx, x, start_n, end_n):
@@ -55,6 +56,9 @@ def run_worker_client(name, master_ip, port, use_gpu):
         while True:
             msg = recv_msg(sock)
             if msg is None: break
+            
+            print(f"Received Message: {msg[0]} for block {msg[1]} (slice {msg[3]}:{msg[4]})")
+            
             task, block_idx, x, start_idx, end_idx = msg
             
             if task == 'QUIT': break
