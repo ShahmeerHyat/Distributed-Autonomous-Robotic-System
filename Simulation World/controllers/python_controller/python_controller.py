@@ -33,14 +33,14 @@ print("[EDGE] Robot and devices initialized.")
 # Load YOLO once before loop
 # ---------------------------
 print("[EDGE] Loading YOLO model...")
-yolo_model = YOLO("yolov8n.pt")  # Nano model is perfect for CPU
+yolo_model = YOLO("yolov8s.pt")
 print("[EDGE] YOLO model loaded.")
 
 # ---------------------------
 # CPU Optimization Settings
 # ---------------------------
-INFER_EVERY_N_FRAMES = 3   # YOLO only runs 1 out of every 3 frames
-YOLO_RESOLUTION = 320      # Cut resolution in half (Default is 640)
+INFER_EVERY_N_FRAMES = 1
+YOLO_RESOLUTION = 320
 
 # ---------------------------
 # Metrics Tracking
@@ -70,8 +70,7 @@ def print_benchmark():
     print("=" * 65)
     print(f"  {'Metric':<14} {'Min':>8} {'Max':>8} {'Avg':>8}")
     print("-" * 65)
-    
-    # Safely calculate averages
+
     avg_cap = sum(capture_times)/len(capture_times) if capture_times else 0
     avg_pre = sum(preprocess_times)/len(preprocess_times) if preprocess_times else 0
     avg_inf = sum(inference_times)/n_infer if n_infer > 0 else 0
@@ -86,76 +85,123 @@ def print_benchmark():
     print("=" * 65 + "\n")
 
 # ---------------------------
+# Tracking Config
+# ---------------------------
+TARGET_CLASS = "sports ball"
+CENTER_TOL = 0.1
+AREA_STOP_THRESHOLD = 0.25
+
+# ---------------------------
+# ByteTrack State
+# ---------------------------
+TARGET_TRACK_ID = None        # Lock onto first detected ball's track ID
+last_target_box = None        # Fallback cache if tracker loses target briefly
+
+# ---------------------------
 # Main Loop
 # ---------------------------
-print("[EDGE] Starting main loop...")
+print("[EDGE] Starting ByteTrack tracking loop...")
 frame_count = 0
-last_detected_labels = []
+
+def get_frame(camera):
+    raw = camera.getImage()
+    if not raw:
+        return None
+    w, h = camera.getWidth(), camera.getHeight()
+    return np.ascontiguousarray(
+        np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))[:, :, 2::-1]
+    )
+
 
 while robot.step(timestep) != -1:
 
-    if frame_count >= 500:
-        break
-        
-    t_frame_start = time.perf_counter()
     frame_count += 1
+    target_box = None
 
-    # ---------- CAPTURE FRAME ----------
-    t_capture_start = time.perf_counter()
-    raw_image = camera.getImage()
-    width     = camera.getWidth()
-    height    = camera.getHeight()
-
-    if not raw_image:
+    # ---------- ONE LINE CAPTURE + PREPROCESS ----------
+    frame = get_frame(camera)
+    if frame is None:
         continue
 
-    t_capture_end = time.perf_counter()
+    # ---------- BYTETRACK ----------
+    t_infer_start = time.perf_counter()
 
-    # ---------- PREPROCESS ----------
-    t_pre_start = time.perf_counter()
+    try:
+        results = yolo_model.track(
+            frame,                        # <-- direct frame in, no extra steps
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False,
+            imgsz=YOLO_RESOLUTION
+        )[0]
 
-    frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 4))
-    # CPU Optimization: Single-pass slice to drop alpha (4th channel) and reverse BGR to RGB
-    frame = np.ascontiguousarray(frame[:, :, 2::-1]) 
+        boxes = results.boxes
+        names = results.names
+        best_area = 0
 
-    t_pre_end = time.perf_counter()
+        if boxes is not None and boxes.id is not None:
+            for i, box in enumerate(boxes):
+                cls_id   = int(box.cls[0])
+                cls_name = names[cls_id]
+                track_id = int(boxes.id[i])
 
-    # ---------- RUN YOLO (CPU OPTIMIZED) ----------
-    inference_ms = 0  # Default to 0 for skipped frames
-    
-    if frame_count % INFER_EVERY_N_FRAMES == 0:
-        t_infer_start = time.perf_counter()
+                if cls_name != TARGET_CLASS:
+                    continue
 
-        try:
-            # CPU Optimization: Lower imgsz dramatically reduces CPU load
-            results         = yolo_model(frame, verbose=False, imgsz=YOLO_RESOLUTION)
-            boxes           = results[0].boxes
-            class_names     = results[0].names
-            last_detected_labels = [class_names[int(cls)] for cls in boxes.cls] if len(boxes) > 0 else []
-        except Exception as e:
-            print(f"[EDGE] YOLO error: {e}")
-            last_detected_labels = []
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                area = (x2 - x1) * (y2 - y1)
 
-        t_infer_end = time.perf_counter()
-        inference_ms = (t_infer_end - t_infer_start) * 1000
-        inference_times.append(inference_ms)
+                if TARGET_TRACK_ID is None:
+                    TARGET_TRACK_ID = track_id
+                    print(f"[BYTETRACK] Locked onto Track ID: {TARGET_TRACK_ID}")
 
-    # Use the cached labels on skipped frames
-    detected_labels = last_detected_labels
+                if track_id == TARGET_TRACK_ID:
+                    if area > best_area:
+                        best_area  = area
+                        target_box = (x1, y1, x2, y2)
 
-    # ---------- USE DETECTIONS ----------
-    # Uncomment to see detections spam:
-    # if detected_labels:
-    #     print(f"[EDGE] Detected: {detected_labels}")
+        if target_box is None and TARGET_TRACK_ID is not None:
+            print(f"[BYTETRACK] Lost Track ID {TARGET_TRACK_ID} — reacquiring...")
+            TARGET_TRACK_ID = None
 
-    # # ---------- COMPUTE & LOG TIMINGS ----------
-    capture_ms    = (t_capture_end - t_capture_start) * 1000
-    preprocess_ms = (t_pre_end     - t_pre_start)     * 1000
-    total_ms      = (time.perf_counter() - t_frame_start) * 1000
+        last_target_box = target_box
 
-    capture_times.append(capture_ms)
-    preprocess_times.append(preprocess_ms)
-    total_times.append(total_ms)
+    except Exception as e:
+        print(f"[EDGE] Tracker error: {e}")
+        last_target_box = None
 
-# Loop exited — simulation stopped
-print_benchmark()
+    inference_times.append((time.perf_counter() - t_infer_start) * 1000)
+
+    if target_box is None:
+        target_box = last_target_box
+
+    # ---------- CONTROL ----------
+    if target_box is not None:
+        x1, y1, x2, y2 = target_box
+        w = camera.getWidth()
+
+        obj_center_x   = (x1 + x2) / 2
+        frame_center_x = w / 2
+        error = (obj_center_x - frame_center_x) / frame_center_x
+        area  = ((x2 - x1) * (y2 - y1)) / (w * camera.getHeight())
+
+        if area > AREA_STOP_THRESHOLD:
+            left_speed = right_speed = 0
+            print(f"[EDGE] Target reached (Track ID {TARGET_TRACK_ID}) — stopping")
+
+        elif abs(error) < CENTER_TOL:
+            left_speed = right_speed = MAX_SPEED
+
+        elif error > 0:
+            left_speed  = MAX_SPEED
+            right_speed = MAX_SPEED * (1 - abs(error))
+
+        else:
+            left_speed  = MAX_SPEED * (1 - abs(error))
+            right_speed = MAX_SPEED
+
+    else:
+        left_speed = right_speed = 0
+
+    left_motor.setVelocity(left_speed)
+    right_motor.setVelocity(right_speed)

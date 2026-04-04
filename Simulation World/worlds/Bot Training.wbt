@@ -8,12 +8,13 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 WorldInfo {
 }
 Viewpoint {
-  orientation 0.07875960307100863 -0.9591864085339584 -0.2715849012883875 5.69594593902417
-  position -1.536768197197812 -0.25611147030474773 0.3204466846225713
+  orientation 0.1588896995778795 -0.840084542435238 -0.5186636915472569 5.583819738420158
+  position -0.915696857053119 0.01671575468977561 0.07049151870810866
 }
 TexturedBackground {
 }
 TexturedBackgroundLight {
+  castShadows FALSE
 }
 RectangleArena {
   translation -0.458228 -0.0935733 -0.58
@@ -21,26 +22,33 @@ RectangleArena {
   floorSize 8 11
 }
 E-puck {
-  translation -0.20189749036541696 -0.34651991504741314 -0.5800639621524909
-  rotation -1.5353908131308366e-05 1.6037874611518035e-05 0.999999999753522 1.5272146218716607
+  translation -0.33844 0.0908796 -0.580064
+  rotation 0.0007044868250979451 -1.534939618922478e-05 0.9999997517313238 -0.043585307179585975
   controller "python_controller"
   camera_fieldOfView 0.8
   camera_width 640
   camera_height 480
 }
+
 DEF TENNIS_BALL Robot {
-  translation 0 0.05 -0.53
-  supervisor TRUE
+  translation 0.00858133 0.0913626 -0.53
   children [
     Shape {
       appearance Appearance {
         material Material {
-          diffuseColor 0.2 1 0.2
+          diffuseColor 1 1 1
+          ambientIntensity 1.0
+          emissiveColor 0.2 0.2 0.2
+        }
+        texture ImageTexture {
+          url [ "soccer_ball.jpg" ]
         }
       }
       geometry Sphere {
         radius 0.04
+        subdivision 4
       }
+      castShadows FALSE
     }
   ]
   name "tennis_ball"
@@ -51,4 +59,41 @@ DEF TENNIS_BALL Robot {
     mass 0.1
   }
   controller "ball_motion"
+  supervisor TRUE
+}
+
+DirectionalLight {
+  direction 0 -1 0       # top down
+  intensity 0.6
+  castShadows FALSE
+}
+
+DirectionalLight {
+  direction 0 1 0        # bottom up
+  intensity 0.4
+  castShadows FALSE
+}
+
+DirectionalLight {
+  direction 1 0 0        # from right
+  intensity 0.4
+  castShadows FALSE
+}
+
+DirectionalLight {
+  direction -1 0 0       # from left
+  intensity 0.4
+  castShadows FALSE
+}
+
+DirectionalLight {
+  direction 0 0 1        # from front
+  intensity 0.4
+  castShadows FALSE
+}
+
+DirectionalLight {
+  direction 0 0 -1       # from back
+  intensity 0.4
+  castShadows FALSE
 }
