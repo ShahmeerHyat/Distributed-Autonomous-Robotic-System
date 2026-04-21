@@ -20,12 +20,12 @@ PROBE_FAIL_LATENCY = 999.0  # sentinel used when a probe dispatch fails
 
 
 class MasterOrchestrator:
-    def __init__(self, expected_workers, host="0.0.0.0", port=29500):
+    def __init__(self, expected_workers, host="0.0.0.0", port=29500, model=None):
         self.expected_workers = expected_workers
         self.all_devices      = ["edge"] + expected_workers
         self.arima            = MultiDeviceARIMAManager(self.all_devices)
 
-        self.model = models.vit_b_16(weights="DEFAULT").eval()
+        self.model = model or models.vit_b_16(weights="DEFAULT").eval()
         self.meta  = get_model_metadata(self.model)
 
         self.sockets: dict[str, socket.socket] = {}
