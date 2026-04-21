@@ -1,7 +1,9 @@
-from controller import Robot    # type: ignore
+from controller import Robot
 import numpy as np
-from ultralytics import YOLO
+import torch
 import time
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
 
 # ---------------------------
 # Initialize Robot & Devices
@@ -20,188 +22,103 @@ MAX_SPEED = 6.28
 camera = robot.getDevice("camera")
 camera.enable(timestep)
 
-# ----- Distance Sensors -----
-proximity = []
-for i in range(8):
-    ps = robot.getDevice(f"ps{i}")
-    ps.enable(timestep)
-    proximity.append(ps)
-
-print("[EDGE] Robot and devices initialized.")
+print("[ViT-EDGE] Robot initialized.")
 
 # ---------------------------
-# Load YOLO once before loop
+# Load ViT (CLIP) Model
 # ---------------------------
-print("[EDGE] Loading YOLO model...")
-yolo_model = YOLO("yolov8s.pt")
-print("[EDGE] YOLO model loaded.")
+print("[ViT-EDGE] Loading CLIP-ViT model...")
+model_id = "openai/clip-vit-base-patch32"
+model = CLIPModel.from_pretrained(model_id)
+processor = CLIPProcessor.from_pretrained(model_id)
+model.eval() # Set to evaluation mode
+print("[ViT-EDGE] ViT loaded.")
 
 # ---------------------------
-# CPU Optimization Settings
+# Semantic Config
 # ---------------------------
-INFER_EVERY_N_FRAMES = 1
-YOLO_RESOLUTION = 320
+SEARCH_PROMPT = "a round ball with black and white patches"
+CENTER_TOL = 0.15
+# Lowered threshold slightly; adjust based on your lighting/simulation
+CONFIDENCE_THRESHOLD = 18.0 
 
-# ---------------------------
-# Metrics Tracking
-# ---------------------------
-capture_times     = []
-preprocess_times  = []
-inference_times   = []
-total_times       = []
-
-session_start = time.perf_counter()
-
-# ---------------------------
-# Print Benchmark Summary
-# ---------------------------
-def print_benchmark():
-    n_total = len(total_times)
-    n_infer = len(inference_times)
-    
-    if n_total == 0:
-        print("[EDGE] No frames processed — nothing to report.")
-        return
-        
-    session_duration = time.perf_counter() - session_start
-
-    print("\n" + "=" * 65)
-    print(f"  BENCHMARK RESULTS — {session_duration:.1f}s | {n_total} frames | {n_total/session_duration:.1f} Effective FPS")
-    print("=" * 65)
-    print(f"  {'Metric':<14} {'Min':>8} {'Max':>8} {'Avg':>8}")
-    print("-" * 65)
-
-    avg_cap = sum(capture_times)/len(capture_times) if capture_times else 0
-    avg_pre = sum(preprocess_times)/len(preprocess_times) if preprocess_times else 0
-    avg_inf = sum(inference_times)/n_infer if n_infer > 0 else 0
-    avg_tot = sum(total_times)/n_total if total_times else 0
-
-    print(f"  {'Capture':<14} {min(capture_times, default=0):>7.1f}ms {max(capture_times, default=0):>7.1f}ms {avg_cap:>7.1f}ms")
-    print(f"  {'Preprocess':<14} {min(preprocess_times, default=0):>7.1f}ms {max(preprocess_times, default=0):>7.1f}ms {avg_pre:>7.1f}ms")
-    print(f"  {'Inference*':<14} {min(inference_times, default=0):>7.1f}ms {max(inference_times, default=0):>7.1f}ms {avg_inf:>7.1f}ms")
-    print(f"  {'Total/Frame':<14} {min(total_times, default=0):>7.1f}ms {max(total_times, default=0):>7.1f}ms {avg_tot:>7.1f}ms")
-    print("-" * 65)
-    print(f"  *Inference ran on {n_infer} out of {n_total} frames (every {INFER_EVERY_N_FRAMES} frames)")
-    print("=" * 65 + "\n")
-
-# ---------------------------
-# Tracking Config
-# ---------------------------
-TARGET_CLASS = "sports ball"
-CENTER_TOL = 0.1
-AREA_STOP_THRESHOLD = 0.25
-
-# ---------------------------
-# ByteTrack State
-# ---------------------------
-TARGET_TRACK_ID = None        # Lock onto first detected ball's track ID
-last_target_box = None        # Fallback cache if tracker loses target briefly
+def get_frame_as_pil(camera):
+    raw = camera.getImage()
+    if not raw: return None
+    w, h = camera.getWidth(), camera.getHeight()
+    img_np = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))[:, :, 2::-1]
+    return Image.fromarray(img_np.astype('uint8'), 'RGB')
 
 # ---------------------------
 # Main Loop
 # ---------------------------
-print("[EDGE] Starting ByteTrack tracking loop...")
-frame_count = 0
-
-def get_frame(camera):
-    raw = camera.getImage()
-    if not raw:
-        return None
-    w, h = camera.getWidth(), camera.getHeight()
-    return np.ascontiguousarray(
-        np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))[:, :, 2::-1]
-    )
-
+print(f"[ViT-EDGE] Searching for: '{SEARCH_PROMPT}'")
 
 while robot.step(timestep) != -1:
+    pil_img = get_frame_as_pil(camera)
+    if pil_img is None: continue
 
-    frame_count += 1
-    target_box = None
+    # 1. Prepare Inputs
+    inputs = processor(text=[SEARCH_PROMPT], images=pil_img, return_tensors="pt", padding=True)
 
-    # ---------- ONE LINE CAPTURE + PREPROCESS ----------
-    frame = get_frame(camera)
-    if frame is None:
-        continue
+    # 2. Inference
+    with torch.no_grad():
+        outputs = model(**inputs)
+        
+    # Get global similarity scores
+    logits_per_image = outputs.logits_per_image 
 
-    # ---------- BYTETRACK ----------
-    t_infer_start = time.perf_counter()
+    # 3. Spatial Localization (Heatmap Logic)
+    # last_hidden_state: [1, 50, 768] (1 CLS + 49 patches)
+    # text_embeds: [1, 512]
+    
+    last_hidden_state = outputs.vision_model_output.last_hidden_state
+    text_embeds = outputs.text_embeds
 
-    try:
-        results = yolo_model.track(
-            frame,                        # <-- direct frame in, no extra steps
-            persist=True,
-            tracker="bytetrack.yaml",
-            verbose=False,
-            imgsz=YOLO_RESOLUTION
-        )[0]
+    # Extract spatial patches (indices 1 to 49)
+    patches = last_hidden_state[:, 1:, :] # [1, 49, 768]
+    
+    # Project patches from 768 -> 512
+    projected_patches = model.visual_projection(patches) # [1, 49, 512]
+    
+    # Normalize for cosine similarity calculation
+    projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
+    norm_text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
 
-        boxes = results.boxes
-        names = results.names
-        best_area = 0
+    # Calculate similarity: [49, 512] @ [512, 1] -> [49, 1]
+    heatmap = torch.matmul(projected_patches[0], norm_text_embeds.t()).squeeze()
+    
+    # Find the patch with the highest match
+    best_patch_idx = torch.argmax(heatmap).item()
 
-        if boxes is not None and boxes.id is not None:
-            for i, box in enumerate(boxes):
-                cls_id   = int(box.cls[0])
-                cls_name = names[cls_id]
-                track_id = int(boxes.id[i])
-
-                if cls_name != TARGET_CLASS:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                area = (x2 - x1) * (y2 - y1)
-
-                if TARGET_TRACK_ID is None:
-                    TARGET_TRACK_ID = track_id
-                    print(f"[BYTETRACK] Locked onto Track ID: {TARGET_TRACK_ID}")
-
-                if track_id == TARGET_TRACK_ID:
-                    if area > best_area:
-                        best_area  = area
-                        target_box = (x1, y1, x2, y2)
-
-        if target_box is None and TARGET_TRACK_ID is not None:
-            print(f"[BYTETRACK] Lost Track ID {TARGET_TRACK_ID} — reacquiring...")
-            TARGET_TRACK_ID = None
-
-        last_target_box = target_box
-
-    except Exception as e:
-        print(f"[EDGE] Tracker error: {e}")
-        last_target_box = None
-
-    inference_times.append((time.perf_counter() - t_infer_start) * 1000)
-
-    if target_box is None:
-        target_box = last_target_box
-
-    # ---------- CONTROL ----------
-    if target_box is not None:
-        x1, y1, x2, y2 = target_box
-        w = camera.getWidth()
-
-        obj_center_x   = (x1 + x2) / 2
-        frame_center_x = w / 2
-        error = (obj_center_x - frame_center_x) / frame_center_x
-        area  = ((x2 - x1) * (y2 - y1)) / (w * camera.getHeight())
-
-        if area > AREA_STOP_THRESHOLD:
-            left_speed = right_speed = 0
-            print(f"[EDGE] Target reached (Track ID {TARGET_TRACK_ID}) — stopping")
-
-        elif abs(error) < CENTER_TOL:
-            left_speed = right_speed = MAX_SPEED
-
-        elif error > 0:
-            left_speed  = MAX_SPEED
-            right_speed = MAX_SPEED * (1 - abs(error))
-
-        else:
-            left_speed  = MAX_SPEED * (1 - abs(error))
-            right_speed = MAX_SPEED
-
+    # Convert patch index to X-coordinate (7x7 grid for patch-32)
+    grid_size = 7 
+    patch_x = best_patch_idx % grid_size
+    
+    # Normalize X to [-1.0, 1.0] for steering
+    # patch_x: 0, 1, 2 (left) | 3 (center) | 4, 5, 6 (right)
+    error = (patch_x - 3) / 3.0
+    
+    # 4. Control Logic (Proportional Steering)
+    if logits_per_image.item() > CONFIDENCE_THRESHOLD:
+        print(f"[FOUND] Confidence: {logits_per_image.item():.2f} | Error: {error:.2f}")
+        
+        if abs(error) < CENTER_TOL:
+            # Move Forward
+            left_speed = right_speed = MAX_SPEED * 0.7
+        elif error > 0: 
+            # Target is to the right
+            left_speed  = MAX_SPEED * 0.6
+            right_speed = MAX_SPEED * 0.1
+        else: 
+            # Target is to the left
+            left_speed  = MAX_SPEED * 0.1
+            right_speed = MAX_SPEED * 0.6
     else:
-        left_speed = right_speed = 0
+        print(f"[SEARCHING] Confidence: {logits_per_image.item():.2f}")
+        # Search mode: spin in place
+        left_speed  = MAX_SPEED * 0.3
+        right_speed = -MAX_SPEED * 0.3
 
     left_motor.setVelocity(left_speed)
     right_motor.setVelocity(right_speed)
