@@ -1,124 +1,179 @@
 from controller import Robot
 import numpy as np
 import torch
-import time
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
 # ---------------------------
-# Initialize Robot & Devices
+# Initialize Robot
 # ---------------------------
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 
-# ----- Motors -----
+print("[INIT] Booting robot...")
+
+for _ in range(5):
+    robot.step(timestep)
+
+# ---------------------------
+# Devices
+# ---------------------------
 left_motor  = robot.getDevice("left wheel motor")
 right_motor = robot.getDevice("right wheel motor")
+
 left_motor.setPosition(float('inf'))
 right_motor.setPosition(float('inf'))
+
 MAX_SPEED = 6.28
 
-# ----- Camera -----
 camera = robot.getDevice("camera")
 camera.enable(timestep)
 
-print("[ViT-EDGE] Robot initialized.")
+print("[INIT] Devices ready.")
 
 # ---------------------------
-# Load ViT (CLIP) Model
+# Load CLIP Model
 # ---------------------------
-print("[ViT-EDGE] Loading CLIP-ViT model...")
-model_id = "openai/clip-vit-base-patch32"
-model = CLIPModel.from_pretrained(model_id)
-processor = CLIPProcessor.from_pretrained(model_id)
-model.eval() # Set to evaluation mode
-print("[ViT-EDGE] ViT loaded.")
+print("[INIT] Loading CLIP model...")
+
+model_path = r"../../../Clip Model"
+model      = CLIPModel.from_pretrained(model_path, local_files_only=True)
+processor  = CLIPProcessor.from_pretrained(model_path, local_files_only=True)
+model.eval()
+
+print("[INIT] CLIP loaded successfully.")
 
 # ---------------------------
-# Semantic Config
+# Settings
 # ---------------------------
-SEARCH_PROMPT = "a round ball with black and white patches"
-CENTER_TOL = 0.15
-# Lowered threshold slightly; adjust based on your lighting/simulation
-CONFIDENCE_THRESHOLD = 18.0 
+SEARCH_PROMPT        = "a round ball with black and white patches"
+CENTER_TOL           = 0.05   # ±15% of frame width → considered centred
+CONFIDENCE_THRESHOLD = 20.0
+EMA_ALPHA            = 0.4
 
-def get_frame_as_pil(camera):
-    raw = camera.getImage()
-    if not raw: return None
-    w, h = camera.getWidth(), camera.getHeight()
-    img_np = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))[:, :, 2::-1]
-    return Image.fromarray(img_np.astype('uint8'), 'RGB')
+# Drive constants
+BASE_SPEED  = MAX_SPEED * 0.40   # forward creep while centering
+TURN_GAIN   = MAX_SPEED * 0.50   # steering authority
+SEARCH_SPEED = MAX_SPEED * 0.30  # spin speed when object not found
+
+# Frame-skip: run CLIP every N steps
+INFERENCE_EVERY_N = 3
+
+# ---------------------------
+# Pre-compute patch grid once
+# ---------------------------
+GRID_SIZE = 7
+_xs = torch.arange(GRID_SIZE).unsqueeze(0).repeat(GRID_SIZE, 1).flatten().float()
+
+
+def get_frame_as_pil(cam):
+    raw = cam.getImage()
+    if not raw:
+        return None
+    w   = cam.getWidth()
+    h   = cam.getHeight()
+    img = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+    return Image.fromarray(img[:, :, [2, 1, 0]])   # BGRA → RGB
+
+
+def compute_speeds(error):
+    """
+    Given a normalised lateral error (−1 … +1), return motor speeds
+    that keep the detected object centred in the frame.
+
+    States
+    ------
+    CENTRED  : error within tolerance → drive straight
+    LEFT     : object is left of centre → turn left
+    RIGHT    : object is right of centre → turn right
+    """
+    if abs(error) < CENTER_TOL:
+        # Already centred — drive straight
+        return BASE_SPEED, BASE_SPEED, "CENTRED"
+
+    # Reduce forward speed proportionally to how far off-centre the object is,
+    # and add a turn delta to steer toward it.
+    forward_speed = BASE_SPEED * (1.0 - 0.4 * abs(error))
+    turn_delta    = TURN_GAIN  * error
+
+    left_speed  = max(-MAX_SPEED, min(MAX_SPEED, forward_speed + turn_delta))
+    right_speed = max(-MAX_SPEED, min(MAX_SPEED, forward_speed - turn_delta))
+
+    direction = "RIGHT" if error > 0 else "LEFT"
+    return left_speed, right_speed, direction
+
+
+# ---------------------------
+# Persistent state
+# ---------------------------
+last_logits = 0.0
+last_error  = 0.0
+step_count  = 0
+
+print(f"[RUN] Searching for: '{SEARCH_PROMPT}'")
 
 # ---------------------------
 # Main Loop
 # ---------------------------
-print(f"[ViT-EDGE] Searching for: '{SEARCH_PROMPT}'")
-
 while robot.step(timestep) != -1:
-    pil_img = get_frame_as_pil(camera)
-    if pil_img is None: continue
 
-    # 1. Prepare Inputs
-    inputs = processor(text=[SEARCH_PROMPT], images=pil_img, return_tensors="pt", padding=True)
+    step_count    += 1
+    run_inference  = (step_count % INFERENCE_EVERY_N == 0)
 
-    # 2. Inference
-    with torch.no_grad():
-        outputs = model(**inputs)
-        
-    # Get global similarity scores
-    logits_per_image = outputs.logits_per_image 
+    # ---------------------------
+    # CLIP inference (frame-skipped)
+    # ---------------------------
+    if run_inference:
+        image = get_frame_as_pil(camera)
 
-    # 3. Spatial Localization (Heatmap Logic)
-    # last_hidden_state: [1, 50, 768] (1 CLS + 49 patches)
-    # text_embeds: [1, 512]
-    
-    last_hidden_state = outputs.vision_model_output.last_hidden_state
-    text_embeds = outputs.text_embeds
+        if image is not None:
+            inputs = processor(
+                text=[SEARCH_PROMPT],
+                images=image,
+                return_tensors="pt",
+                padding=True
+            )
 
-    # Extract spatial patches (indices 1 to 49)
-    patches = last_hidden_state[:, 1:, :] # [1, 49, 768]
-    
-    # Project patches from 768 -> 512
-    projected_patches = model.visual_projection(patches) # [1, 49, 512]
-    
-    # Normalize for cosine similarity calculation
-    projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
-    norm_text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+            with torch.no_grad():
+                outputs = model(**inputs)
 
-    # Calculate similarity: [49, 512] @ [512, 1] -> [49, 1]
-    heatmap = torch.matmul(projected_patches[0], norm_text_embeds.t()).squeeze()
-    
-    # Find the patch with the highest match
-    best_patch_idx = torch.argmax(heatmap).item()
+            last_logits = outputs.logits_per_image.item()
 
-    # Convert patch index to X-coordinate (7x7 grid for patch-32)
-    grid_size = 7 
-    patch_x = best_patch_idx % grid_size
-    
-    # Normalize X to [-1.0, 1.0] for steering
-    # patch_x: 0, 1, 2 (left) | 3 (center) | 4, 5, 6 (right)
-    error = (patch_x - 3) / 3.0
-    
-    # 4. Control Logic (Proportional Steering)
-    if logits_per_image.item() > CONFIDENCE_THRESHOLD:
-        print(f"[FOUND] Confidence: {logits_per_image.item():.2f} | Error: {error:.2f}")
-        
-        if abs(error) < CENTER_TOL:
-            # Move Forward
-            left_speed = right_speed = MAX_SPEED * 0.7
-        elif error > 0: 
-            # Target is to the right
-            left_speed  = MAX_SPEED * 0.6
-            right_speed = MAX_SPEED * 0.1
-        else: 
-            # Target is to the left
-            left_speed  = MAX_SPEED * 0.1
-            right_speed = MAX_SPEED * 0.6
+            # ── Spatial heatmap → lateral error ──────────────────────
+            patches   = outputs.vision_model_output.last_hidden_state[:, 1:, :]
+            projected = model.visual_projection(patches)
+            projected = projected / projected.norm(dim=-1, keepdim=True)
+
+            text_emb  = outputs.text_embeds
+            text_emb  = text_emb / text_emb.norm(dim=-1, keepdim=True)
+
+            heatmap  = torch.matmul(projected[0], text_emb.t()).squeeze()
+            weights  = torch.softmax(heatmap, dim=0)
+
+            center_x  = (weights * _xs).sum().item()
+            center    = (GRID_SIZE - 1) / 2
+            raw_error = (center_x - center) / center        # −1 (left) … +1 (right)
+
+            # EMA smoothing to reduce frame-to-frame jitter
+            last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
+
+    # ---------------------------
+    # Motor control
+    # ---------------------------
+    if last_logits > CONFIDENCE_THRESHOLD:
+        left_speed, right_speed, state_label = compute_speeds(last_error)
+
+        if run_inference:
+            print(f"[FOUND]     score={last_logits:.2f}  "
+                  f"error={last_error:+.2f}  → {state_label}")
     else:
-        print(f"[SEARCHING] Confidence: {logits_per_image.item():.2f}")
-        # Search mode: spin in place
-        left_speed  = MAX_SPEED * 0.3
-        right_speed = -MAX_SPEED * 0.3
+        # Object not detected → spin in place to search
+        last_error  = 0.0          # clear stale error before re-acquisition
+        left_speed  =  SEARCH_SPEED
+        right_speed = -SEARCH_SPEED
+
+        if run_inference:
+            print(f"[SEARCHING] score={last_logits:.2f}")
 
     left_motor.setVelocity(left_speed)
     right_motor.setVelocity(right_speed)

@@ -1,3 +1,4 @@
 /yolo_venv/
 *.pt
 /runs
+/Clip Model
