@@ -123,26 +123,31 @@ class MasterOrchestrator:
 
         for i, block in enumerate(self.model.encoder.layers):
 
-            # ── Per-block bookkeeping ─────────────────────────────────────
-            # raw_latency  : wall-clock time observed for this device this block
-            # share_used   : share actually dispatched (needed for normalisation)
             raw_latency = {dev: 0.0 for dev in self.all_devices}
             share_used  = {dev: 0.0 for dev in self.all_devices}
 
-            # Track which workers are on probes this block
             probing_workers: set[str] = {
                 w for w in self.expected_workers
                 if w in self.arima.breakers and self.arima.breakers[w].is_half_open
             }
 
-            # Update shares BEFORE this block
             self.arima.update_shares()
 
-            # ── PHASE 1: ATTENTION ────────────────────────────────────────
-            identity = current_state
-            ln_x     = block.ln_1(current_state)
+            # ── Resolve block attribute names once per block ──────────────────
+            # Handles torchvision (ln_1/ln_2, self_attention, mlp[0]/mlp[3])
+            # and CLIP          (layer_norm1/layer_norm2, self_attn, mlp.fc1/mlp.fc2)
+            ln_1  = getattr(block, "ln_1",         None) or block.layer_norm1
+            ln_2  = getattr(block, "ln_2",         None) or block.layer_norm2
+            attn  = getattr(block, "self_attention",None) or block.self_attn
+            mlp   = block.mlp
+            is_sequential = isinstance(mlp, torch.nn.Sequential)
+            fc1   = mlp[0] if is_sequential else mlp.fc1
+            fc2   = mlp[3] if is_sequential else mlp.fc2
 
-            # 1. Dispatch worker ATTN tasks
+            # ── PHASE 1: ATTENTION ────────────────────────────────────────────
+            identity = current_state
+            ln_x     = ln_1(current_state)
+
             attn_futures = {}
             for w_name in self.expected_workers:
                 h_range = self.arima.get_indices(w_name, self.meta["num_heads"])
@@ -153,14 +158,13 @@ class MasterOrchestrator:
                     )
                     share_used[w_name] += self.arima.current_shares[w_name]
 
-            # 2. Local edge ATTN
-            edge_h       = self.arima.get_indices("edge", self.meta["num_heads"])
+            edge_h = self.arima.get_indices("edge", self.meta["num_heads"])
             share_used["edge"] += self.arima.current_shares["edge"]
 
             t_edge = time.time()
             if len(edge_h) > 0:
                 edge_attn_w = get_head_weights(
-                    block.self_attention.in_proj_weight, edge_h,
+                    attn.in_proj_weight, edge_h,
                     self.meta["embed_dim"], self.meta["head_dim"],
                 )
                 edge_qkv = ln_x @ edge_attn_w.t()
@@ -168,7 +172,6 @@ class MasterOrchestrator:
                 edge_qkv = torch.tensor([])
             raw_latency["edge"] += time.time() - t_edge
 
-            # 3. Collect & merge (device order preserved for correctness)
             qkv_parts = []
             for dev in self.all_devices:
                 if dev == "edge":
@@ -180,25 +183,22 @@ class MasterOrchestrator:
                     qkv_parts.append(res)
                     raw_latency[dev] += lat
 
-            merged_qkv = merge_n_projections(qkv_parts)
+            merged_qkv  = merge_n_projections(qkv_parts)
+            merged_qkv += attn.in_proj_bias
+            q, k, v     = torch.chunk(merged_qkv, 3, dim=-1)
+            q, k, v     = (ready_for_math(t, self.meta) for t in (q, k, v))
 
-            # 4. Global softmax (always on master)
-            merged_qkv += block.self_attention.in_proj_bias
-            q, k, v = torch.chunk(merged_qkv, 3, dim=-1)
-            q, k, v = (ready_for_math(t, self.meta) for t in (q, k, v))
-
-            scale       = self.meta["head_dim"] ** -0.5
-            attn_probs  = torch.nn.functional.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)
-            ctx         = attn_probs @ v
-            ctx         = ctx.transpose(1, 2).reshape(1, self.meta["seq_length"], self.meta["embed_dim"])
-            attn_out    = block.self_attention.out_proj(ctx)
+            scale         = self.meta["head_dim"] ** -0.5
+            attn_probs    = torch.nn.functional.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)
+            ctx           = (attn_probs @ v).transpose(1, 2).reshape(
+                                1, self.meta["seq_length"], self.meta["embed_dim"])
+            attn_out      = attn.out_proj(ctx)
             current_state = identity + attn_out
 
-            # ── PHASE 2: MLP ──────────────────────────────────────────────
-            identity  = current_state
-            ln_x_mlp  = block.ln_2(current_state)
+            # ── PHASE 2: MLP ──────────────────────────────────────────────────
+            identity = current_state
+            ln_x_mlp = ln_2(current_state)
 
-            # 1. Dispatch worker MLP tasks
             mlp_futures = {}
             for w_name in self.expected_workers:
                 n_range = self.arima.get_indices(w_name, self.meta["mlp_hidden_dim"])
@@ -207,24 +207,21 @@ class MasterOrchestrator:
                         self._dispatch_task, w_name, "MLP", i,
                         ln_x_mlp, n_range.start, n_range.stop,
                     )
-                    # Add MLP share contribution (cumulative with ATTN)
                     share_used[w_name] = (
                         share_used[w_name] + self.arima.current_shares[w_name]
-                    ) / 2.0   # average ATTN + MLP shares
+                    ) / 2.0
 
-            # 2. Local edge MLP
             edge_n = self.arima.get_indices("edge", self.meta["mlp_hidden_dim"])
             t_edge = time.time()
             if len(edge_n) > 0:
-                w1       = block.mlp[0].weight[edge_n.start:edge_n.stop, :]
-                b1       = block.mlp[0].bias[edge_n.start:edge_n.stop]
-                w2       = block.mlp[3].weight[:, edge_n.start:edge_n.stop]
+                w1       = fc1.weight[edge_n.start:edge_n.stop, :]
+                b1       = fc1.bias[edge_n.start:edge_n.stop]
+                w2       = fc2.weight[:, edge_n.start:edge_n.stop]
                 edge_mlp = torch.nn.functional.gelu(ln_x_mlp @ w1.t() + b1) @ w2.t()
             else:
                 edge_mlp = torch.tensor([])
             raw_latency["edge"] += time.time() - t_edge
 
-            # 3. Collect & sum (ONS)
             mlp_parts = [edge_mlp] if edge_mlp.numel() > 0 else []
             for w_name, fut in mlp_futures.items():
                 res, lat = fut.result()
@@ -232,38 +229,28 @@ class MasterOrchestrator:
                     mlp_parts.append(res)
                 raw_latency[w_name] += lat
 
-            mlp_final     = torch.sum(torch.stack(mlp_parts), dim=0) + block.mlp[3].bias
+            mlp_final     = torch.sum(torch.stack(mlp_parts), dim=0) + fc2.bias
             current_state = identity + mlp_final
 
-            # ── ARIMA update ──────────────────────────────────────────────
+            # ── ARIMA update ──────────────────────────────────────────────────
             for dev in self.all_devices:
                 s = share_used[dev]
-                if s > 0:
-                    self.arima.record_block_latency(dev, raw_latency[dev], s)
-                else:
-                    # Device was OPEN — inject synthetic history
-                    self.arima.record_block_latency(dev, 0.0, 0.0)
+                self.arima.record_block_latency(dev, raw_latency[dev], s if s > 0 else 0.0)
 
-            # ── Probe result feedback ──────────────────────────────────────
-            # For any worker that was on a probe this block, report the outcome
-            # so the circuit breaker can decide CLOSED vs re-OPEN.
             for w_name in probing_workers:
                 s = share_used.get(w_name, 0.0)
                 if s > 0 and raw_latency[w_name] < PROBE_FAIL_LATENCY:
-                    norm_lat = raw_latency[w_name] / s
-                    self.arima.notify_probe_result(w_name, norm_lat)
+                    self.arima.notify_probe_result(w_name, raw_latency[w_name] / s)
                 else:
                     self.arima.notify_probe_result(w_name, PROBE_FAIL_LATENCY)
 
-            # ── Status line ───────────────────────────────────────────────
+            # ── Status line ───────────────────────────────────────────────────
             n_edge_heads   = len(self.arima.get_indices("edge", self.meta["num_heads"]))
             n_worker_heads = sum(
                 len(self.arima.get_indices(w, self.meta["num_heads"]))
                 for w in self.expected_workers
             )
-            cb_status = {
-                w: self.arima.breakers[w].state for w in self.expected_workers
-            }
+            cb_status  = {w: self.arima.breakers[w].state for w in self.expected_workers}
             timing_str = " | ".join(
                 f"{d}: {raw_latency[d]:.4f}s (share={share_used[d]:.2f})"
                 for d in self.all_devices

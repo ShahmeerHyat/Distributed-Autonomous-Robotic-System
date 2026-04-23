@@ -31,33 +31,52 @@ def recv_msg(sock):
     return torch.load(io.BytesIO(data), weights_only=False)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model Math Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
 def get_model_metadata(model):
-    embed_dim   = model.encoder.layers[0].self_attention.in_proj_weight.shape[1]
-    seq_length  = model.encoder.pos_embedding.shape[1]
-    mlp_hidden  = model.encoder.layers[0].mlp[0].weight.shape[0]
-    num_heads   = model.encoder.layers[0].self_attention.num_heads
+    """
+    Works with both torchvision vit_b_16 and CLIP's vision encoder.
+    Detects attribute names at runtime so master.py and spvit_detector.py
+    can share the same utility without branching.
+    """
+    layer = model.encoder.layers[0]
+
+    # Attention block — torchvision uses self_attention, CLIP uses self_attn
+    attn = getattr(layer, "self_attention", None) or getattr(layer, "self_attn")
+
+    # MLP block — torchvision uses mlp[0]/mlp[3], CLIP uses mlp.fc1/mlp.fc2
+    mlp       = layer.mlp
+    mlp_weight = mlp[0].weight if isinstance(mlp, torch.nn.Sequential) else mlp.fc1.weight
+
+    # Positional embedding — torchvision: encoder.pos_embedding, CLIP: embeddings.position_embedding.weight
+    if hasattr(model, "encoder") and hasattr(model.encoder, "pos_embedding"):
+        seq_length = model.encoder.pos_embedding.shape[1]
+    else:
+        seq_length = model.embeddings.position_embedding.weight.shape[0]
+
+    embed_dim = attn.in_proj_weight.shape[1]
+    num_heads = attn.num_heads
+
     return {
         "embed_dim":      embed_dim,
-        "seq_length":     seq_length,
-        "mlp_hidden_dim": mlp_hidden,
         "num_heads":      num_heads,
         "head_dim":       embed_dim // num_heads,
+        "mlp_hidden_dim": mlp_weight.shape[0],
+        "seq_length":     seq_length,
     }
 
+
 def get_head_weights(full_weight, head_indices, embed_dim, head_dim):
+    # Unchanged — in_proj_weight layout is identical in both torchvision and CLIP
     slices = []
-    for i in [0, 1, 2]:          # Q, K, V
+    for i in [0, 1, 2]:
         offset = i * embed_dim
         for h in head_indices:
             start = offset + h * head_dim
             slices.append(full_weight[start:start + head_dim, :])
     return torch.cat(slices, dim=0) if slices else torch.tensor([])
 
+
 def merge_n_projections(projections):
+    # Unchanged
     all_q, all_k, all_v = [], [], []
     for p in projections:
         if p.numel() == 0:
@@ -68,9 +87,10 @@ def merge_n_projections(projections):
         return torch.tensor([])
     return torch.cat([torch.cat(all_q, -1), torch.cat(all_k, -1), torch.cat(all_v, -1)], -1)
 
-def ready_for_math(t, meta):
-    return t.view(1, meta["seq_length"], meta["num_heads"], meta["head_dim"]).transpose(1, 2)
 
+def ready_for_math(t, meta):
+    # Unchanged
+    return t.view(1, meta["seq_length"], meta["num_heads"], meta["head_dim"]).transpose(1, 2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Circuit Breaker
