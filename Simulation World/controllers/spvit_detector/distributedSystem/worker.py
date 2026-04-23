@@ -5,7 +5,7 @@ from transformers import CLIPModel
 
 from shared_utils import recv_msg, send_msg, get_model_metadata
 
-MODEL_PATH = r"../../../Clip Model"
+MODEL_PATH = r"Clip Model"
 
 
 class CLIPWorker:
