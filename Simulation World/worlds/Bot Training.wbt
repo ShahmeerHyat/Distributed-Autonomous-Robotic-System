@@ -30,7 +30,7 @@ E-puck {
   camera_height 480
 }
 DEF TENNIS_BALL Robot {
-  translation 0.00858133 0.121363 -0.54015200154891
+  translation -0.381419 0.121363 -0.540152
   children [
     Shape {
       appearance Appearance {
