@@ -47,13 +47,15 @@ print("[INIT] CLIP loaded successfully.")
 # Settings
 # ---------------------------
 SEARCH_PROMPT        = "a round ball with black and white patches"
-CENTER_TOL           = 0.05   # ±15% of frame width → considered centred
+CENTER_TOL           = 0.03 # ±15% of frame width → considered centred
+ROTATE_ONLY_TOL      = 0.40 # If error is > 40%, stop moving forward and just spin
 CONFIDENCE_THRESHOLD = 20.0
 EMA_ALPHA            = 0.4
+EMP_CENTER           = 3.02 # empirically determined center_x value when object is perfectly centered (for error normalization)  
 
 # Drive constants
-BASE_SPEED  = MAX_SPEED * 0.40   # forward creep while centering
-TURN_GAIN   = MAX_SPEED * 0.50   # steering authority
+BASE_SPEED  = MAX_SPEED * 0.35   # forward creep while centering
+TURN_GAIN   = MAX_SPEED * 0.80   # steering authority
 SEARCH_SPEED = MAX_SPEED * 0.30  # spin speed when object not found
 
 # Frame-skip: run CLIP every N steps
@@ -64,7 +66,7 @@ INFERENCE_EVERY_N = 3
 # ---------------------------
 GRID_SIZE = 7
 _xs = torch.arange(GRID_SIZE).unsqueeze(0).repeat(GRID_SIZE, 1).flatten().float()
-
+print(f"[INIT] _XS grid pre-computed: {_xs.shape}  values={_xs.numpy()} ...")
 
 def get_frame_as_pil(cam):
     raw = cam.getImage()
@@ -78,28 +80,33 @@ def get_frame_as_pil(cam):
 
 def compute_speeds(error):
     """
-    Given a normalised lateral error (−1 … +1), return motor speeds
-    that keep the detected object centred in the frame.
-
-    States
-    ------
-    CENTRED  : error within tolerance → drive straight
-    LEFT     : object is left of centre → turn left
-    RIGHT    : object is right of centre → turn right
+    Improved control logic: 
+    1. If very far off, spin in place.
+    2. If somewhat off, arc toward the object.
+    3. If centered, drive straight.
     """
-    if abs(error) < CENTER_TOL:
-        # Already centred — drive straight
-        return BASE_SPEED, BASE_SPEED, "CENTRED"
+    abs_err = abs(error)
+    
+    # CASE 1: Centered (Drive straight)
+    if abs_err < CENTER_TOL:
+        return BASE_SPEED, BASE_SPEED, "STRICT_CENTER"
 
-    # Reduce forward speed proportionally to how far off-centre the object is,
-    # and add a turn delta to steer toward it.
-    forward_speed = BASE_SPEED * (1.0 - 0.4 * abs(error))
-    turn_delta    = TURN_GAIN  * error
+    # CASE 2: Far off-center (Rotate in place)
+    # This prevents the robot from 'orbiting' the object
+    if abs_err > ROTATE_ONLY_TOL:
+        # High gain rotation, zero forward velocity
+        turn_speed = TURN_GAIN * (error / abs_err) # Keeps direction sign
+        return turn_speed, -turn_speed, "STATIONARY_TURN"
 
-    left_speed  = max(-MAX_SPEED, min(MAX_SPEED, forward_speed + turn_delta))
-    right_speed = max(-MAX_SPEED, min(MAX_SPEED, forward_speed - turn_delta))
+    # CASE 3: Moderate error (Arcing/Proportional steering)
+    # We use a non-linear scaling so it slows down forward speed as it turns
+    forward_speed = BASE_SPEED * (1.0 - (abs_err / ROTATE_ONLY_TOL))
+    turn_delta    = TURN_GAIN * error
+    
+    left_speed  = max(-MAX_SPEED, min(MAX_SPEED, forward_speed - turn_delta))
+    right_speed = max(-MAX_SPEED, min(MAX_SPEED, forward_speed + turn_delta))
 
-    direction = "RIGHT" if error > 0 else "LEFT"
+    direction = "ARC_RIGHT" if error < 0 else "ARC_LEFT"
     return left_speed, right_speed, direction
 
 
@@ -148,14 +155,15 @@ while robot.step(timestep) != -1:
             text_emb  = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
             heatmap  = torch.matmul(projected[0], text_emb.t()).squeeze()
-            weights  = torch.softmax(heatmap, dim=0)
+            weights  = torch.softmax(heatmap / 0.1, dim=0)
 
             center_x  = (weights * _xs).sum().item()
-            center    = (GRID_SIZE - 1) / 2
-            raw_error = (center_x - center) / center        # −1 (left) … +1 (right)
+            # center    = (GRID_SIZE - 1) / 2
+            raw_error = (center_x - EMP_CENTER) / EMP_CENTER        # −1 (left) … +1 (right)
 
+            # print(f"DEBUG: center_x={center_x:.2f} raw_error={raw_error}")
             # EMA smoothing to reduce frame-to-frame jitter
-            last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
+            last_error = raw_error
 
     # ---------------------------
     # Motor control
@@ -169,8 +177,8 @@ while robot.step(timestep) != -1:
     else:
         # Object not detected → spin in place to search
         last_error  = 0.0          # clear stale error before re-acquisition
-        left_speed  =  SEARCH_SPEED
-        right_speed = -SEARCH_SPEED
+        left_speed  = -SEARCH_SPEED
+        right_speed = SEARCH_SPEED
 
         if run_inference:
             print(f"[SEARCHING] score={last_logits:.2f}")
