@@ -1,11 +1,11 @@
 from controller import Robot
 import numpy as np
 import torch
+import time
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
 from distributedSystem.master import MasterOrchestrator
-from distributedSystem.shared_utils import get_head_weights, merge_n_projections, ready_for_math
 
 # ---------------------------
 # Initialize Robot
@@ -136,58 +136,64 @@ def _distributed_encoder_forward(current_state: torch.Tensor) -> torch.Tensor:
         identity = current_state
         ln_x     = block.layer_norm1(current_state)   # CLIP name
 
-        # Dispatch workers
-        attn_futures = {}
-        for w_name in orch.expected_workers:
-            h_range = orch.arima.get_indices(w_name, CLIP_META["num_heads"])
-            if len(h_range) > 0:
-                attn_futures[w_name] = orch.executor.submit(
-                    orch._dispatch_task, w_name, "ATTN", i,
-                    ln_x, h_range.start, h_range.stop,
-                )
-                share_used[w_name] += orch.arima.current_shares[w_name]
+        # --- FULL QKV locally (CLIP style) ---
+        q = block.self_attn.q_proj(ln_x)
+        k = block.self_attn.k_proj(ln_x)
+        v = block.self_attn.v_proj(ln_x)
 
-        # Local edge slice
-        edge_h = orch.arima.get_indices("edge", CLIP_META["num_heads"])
-        share_used["edge"] += orch.arima.current_shares["edge"]
+        # reshape to heads
+        def split_heads(x):
+            B, S, D = x.shape
+            H = CLIP_META["num_heads"]
+            return x.view(B, S, H, -1).transpose(1, 2)
 
-        t0 = time.time()
-        if len(edge_h) > 0:
-            # CLIP attr name for in_proj_weight
-            edge_attn_w = get_head_weights(
-                block.self_attn.in_proj_weight, edge_h,
-                CLIP_META["embed_dim"], CLIP_META["head_dim"],
-            )
-            edge_qkv = ln_x @ edge_attn_w.t()
-        else:
-            edge_qkv = torch.tensor([])
-        raw_latency["edge"] += time.time() - t0
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
 
-        # Collect & merge
-        qkv_parts = []
+        # --- distribute HEADS (not weights) ---
+        attn_parts = []
+
         for dev in orch.all_devices:
+            h_range = orch.arima.get_indices(dev, CLIP_META["num_heads"])
+
+            if len(h_range) == 0:
+                continue
+
+            q_slice = q[:, h_range, :, :]
+            k_slice = k[:, h_range, :, :]
+            v_slice = v[:, h_range, :, :]
+
             if dev == "edge":
-                qkv_parts.append(edge_qkv)
-            elif dev in attn_futures:
-                res, lat = attn_futures[dev].result()
-                if res is None:
-                    res = torch.zeros_like(edge_qkv) if edge_qkv.numel() > 0 else torch.tensor([])
-                qkv_parts.append(res)
+                scale = CLIP_META["head_dim"] ** -0.5
+                attn_probs = torch.nn.functional.softmax(
+                    (q_slice @ k_slice.transpose(-2, -1)) * scale,
+                    dim=-1
+                )
+                ctx = attn_probs @ v_slice
+                attn_parts.append(ctx)
+
+            else:
+                fut = orch.executor.submit(
+                    orch._dispatch_task,
+                    dev,
+                    "ATTN",
+                    i,
+                    (q_slice, k_slice, v_slice),
+                    None,
+                    None
+                )
+                res, lat = fut.result()
                 raw_latency[dev] += lat
+                attn_parts.append(res)
 
-        merged_qkv  = merge_n_projections(qkv_parts)
-        merged_qkv += block.self_attn.in_proj_bias   # CLIP attr name
-        q, k, v     = torch.chunk(merged_qkv, 3, dim=-1)
-        q, k, v     = (ready_for_math(t, CLIP_META) for t in (q, k, v))
-
-        scale      = CLIP_META["head_dim"] ** -0.5
-        attn_probs = torch.nn.functional.softmax(
-            (q @ k.transpose(-2, -1)) * scale, dim=-1
-        )
-        ctx        = (attn_probs @ v).transpose(1, 2).reshape(
+        # merge heads
+        ctx = torch.cat(attn_parts, dim=1)
+        ctx = ctx.transpose(1, 2).reshape(
             1, CLIP_META["seq_length"], CLIP_META["embed_dim"]
         )
-        attn_out      = block.self_attn.out_proj(ctx)   # CLIP attr name
+
+        attn_out = block.self_attn.out_proj(ctx)
         current_state = identity + attn_out
 
         # ── MLP ───────────────────────────────────────────────────────────
@@ -263,7 +269,8 @@ def compute_speeds(error):
 # ---------------------------
 text_inputs = processor(text=[SEARCH_PROMPT], return_tensors="pt", padding=True)
 with torch.no_grad():
-    text_emb = clip.get_text_features(**text_inputs)
+    text_outputs = clip.text_model(**text_inputs)
+    text_emb = text_outputs.pooler_output
     text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
 # ---------------------------

@@ -81,6 +81,21 @@ def ready_for_math(t, meta):
     # Unchanged
     return t.view(1, meta["seq_length"], meta["num_heads"], meta["head_dim"]).transpose(1, 2)
 
+def compute_attn_from_slices(self, block_idx, q, k, v):
+    q = q.to(self.device)
+    k = k.to(self.device)
+    v = v.to(self.device)
+
+    scale = self.meta["head_dim"] ** -0.5
+
+    attn_probs = torch.nn.functional.softmax(
+        (q @ k.transpose(-2, -1)) * scale,
+        dim=-1
+    )
+
+    ctx = attn_probs @ v
+    return ctx.cpu()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Circuit Breaker
 #

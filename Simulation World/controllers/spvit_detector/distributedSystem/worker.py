@@ -14,7 +14,9 @@ import argparse
 import socket
 from transformers import CLIPModel
 
-from shared_utils import recv_msg, send_msg, get_model_metadata
+from shared_utils import recv_msg, send_msg, get_model_metadata, compute_attn_from_slices
+
+
 
 MODEL_PATH = r"../../../Clip Model"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +148,12 @@ def run_worker_client(
                 send_msg(sock, torch.tensor([1.0]))
 
             elif task == "ATTN":
-                result = worker.compute_attn_slice(block_idx, x, start_idx, end_idx)
+                result = None
+                if len(msg) == 3:
+                    _, block_idx, payload = msg
+                    q_slice, k_slice, v_slice = payload
+
+                    result = worker.compute_attn_from_slices(block_idx, q_slice, k_slice, v_slice)
                 send_msg(sock, result)
                 print(f"  ATTN  block={block_idx:2d}  "
                       f"heads={start_idx}:{end_idx}  out={tuple(result.shape)}")

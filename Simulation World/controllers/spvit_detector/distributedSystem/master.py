@@ -18,7 +18,7 @@ from transformers import CLIPModel
 
 from distributedSystem.shared_utils import (
     MultiDeviceARIMAManager,
-    get_model_metadata, get_head_weights,
+    get_model_metadata,
     merge_n_projections, ready_for_math,
     send_msg, recv_msg,
 )
@@ -27,6 +27,7 @@ from distributedSystem.shared_utils import (
 PREFLIGHT_PINGS    = 8
 PROBE_FAIL_LATENCY = 999.0
 
+MODEL_PATH = r"../../../../Clip Model"
 
 class MasterOrchestrator:
 
@@ -36,8 +37,7 @@ class MasterOrchestrator:
         host: str        = "0.0.0.0",
         port: int        = 29500,
         model            = None,   # pass clip.vision_model from the detector
-        meta: dict       = None,   # pass CLIP_META from the detector
-        model_path: str  = None,   # only used when model=None (standalone test)
+        meta: dict       = None   # pass CLIP_META from the detector
     ):
         self.expected_workers = expected_workers
         self.all_devices      = ["edge"] + expected_workers
@@ -49,9 +49,7 @@ class MasterOrchestrator:
             self.model = model
         else:
             # Standalone / __main__ mode: load CLIP ourselves
-            src   = model_path or "openai/clip-vit-base-patch32"
-            local = model_path is not None
-            clip  = CLIPModel.from_pretrained(src, local_files_only=local).eval()
+            clip  = CLIPModel.from_pretrained(MODEL_PATH, local_files_only=True).eval()
             self.model = clip.vision_model
 
         self.meta = meta or get_model_metadata(self.model)
@@ -116,17 +114,36 @@ class MasterOrchestrator:
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
-    def _dispatch_task(self, w_name, task_type, block_idx, x, start_idx, end_idx):
+    def _dispatch_task(self, worker_name, task_type, block_idx, payload, start_idx=None, end_idx=None):
         try:
-            t0  = time.time()
-            send_msg(self.sockets[w_name], (task_type, block_idx, x, start_idx, end_idx))
-            res = recv_msg(self.sockets[w_name])
+            sock = self.sockets[worker_name]
+            t0   = time.time()
+
+            # ── ATTENTION ─────────────────────────────────────────────
+            if task_type == "ATTN":
+
+                if isinstance(payload, tuple):
+                    #CLIP MODE (q, k, v slices)
+                    send_msg(sock, ("ATTN", block_idx, payload))
+
+            # ── MLP ───────────────────────────────────────────────────
+            elif task_type == "MLP":
+                send_msg(sock, ("MLP", block_idx, payload, start_idx, end_idx))
+
+            else:
+                raise ValueError(f"Unknown task type: {task_type}")
+
+            # ── RECEIVE RESULT ─────────────────────────────────────────
+            res = recv_msg(sock)
             lat = time.time() - t0
+
             if res is None:
-                raise ConnectionError(f"Worker '{w_name}' disconnected mid-task.")
+                raise ConnectionError(f"Worker '{worker_name}' disconnected mid-task.")
+
             return res, lat
+
         except Exception as exc:
-            print(f"\n  [ERROR] Dispatch to '{w_name}' failed: {exc}")
+            print(f"\n  [ERROR] Dispatch to '{worker_name}' failed: {exc}")
             return None, PROBE_FAIL_LATENCY
 
     # ── Inference ────────────────────────────────────────────────────────────
@@ -324,16 +341,13 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="CLIP MasterOrchestrator standalone test")
-    p.add_argument("--model_path", default=None,
-                   help="Local CLIP checkpoint dir. Omit to use HuggingFace hub.")
     p.add_argument("--port",       type=int, default=29500)
     args = p.parse_args()
 
     orch = MasterOrchestrator(
         expected_workers=["pc_gpu"],
         host="0.0.0.0",
-        port=args.port,
-        model_path=args.model_path,
+        port=args.port
     )
 
     # CLIP ViT-B/32: seq=50 (49 patches + 1 CLS), embed=768
