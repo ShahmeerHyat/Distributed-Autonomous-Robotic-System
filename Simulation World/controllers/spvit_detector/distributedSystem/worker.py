@@ -16,22 +16,18 @@ from transformers import CLIPModel
 
 from shared_utils import recv_msg, send_msg, get_model_metadata
 
-
+MODEL_PATH = r"../../../Clip Model"
 # ─────────────────────────────────────────────────────────────────────────────
 class CLIPWorker:
 
-    def __init__(self, model_path: str = None, use_gpu: bool = True):
+    def __init__(self, use_gpu: bool = True):
         self.device = torch.device(
             "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
         )
         print(f"[Worker] Initialised on: {self.device}")
 
         # Load CLIP — prefer a local path if supplied, else HuggingFace hub
-        clip_src = model_path or "openai/clip-vit-base-patch32"
-        local    = model_path is not None
-        clip     = CLIPModel.from_pretrained(
-            clip_src, local_files_only=local
-        ).to(self.device).eval()
+        clip     = CLIPModel.from_pretrained( MODEL_PATH, local_files_only=True).to(self.device).eval()
 
         # We only need the vision encoder on the worker side
         self.vision = clip.vision_model
@@ -121,10 +117,9 @@ def run_worker_client(
     name: str,
     master_ip: str,
     port: int,
-    use_gpu: bool,
-    model_path: str = None,
+    use_gpu: bool
 ):
-    worker = CLIPWorker(model_path=model_path, use_gpu=use_gpu)
+    worker = CLIPWorker(use_gpu=use_gpu)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     print(f"[Worker] Connecting to master at {master_ip}:{port} …")
@@ -181,15 +176,11 @@ if __name__ == "__main__":
     p.add_argument("--port",       type=int, default=29500)
     p.add_argument("--gpu",        action="store_true",
                    help="Use CUDA if available")
-    p.add_argument("--model_path", default=None,
-                   help="Path to local CLIP checkpoint directory. "
-                        "Omit to download from HuggingFace hub.")
     args = p.parse_args()
 
     run_worker_client(
         name       = args.name,
         master_ip  = args.master_ip,
         port       = args.port,
-        use_gpu    = args.gpu,
-        model_path = args.model_path,
+        use_gpu    = args.gpu
     )
