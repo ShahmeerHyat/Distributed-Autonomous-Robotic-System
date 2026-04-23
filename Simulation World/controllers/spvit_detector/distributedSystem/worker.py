@@ -14,7 +14,7 @@ import argparse
 import socket
 from transformers import CLIPModel
 
-from shared_utils import recv_msg, send_msg, get_model_metadata, get_head_weights
+from shared_utils import recv_msg, send_msg, get_model_metadata
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,14 +44,11 @@ class CLIPWorker:
               f"seq={self.meta['seq_length']})")
 
     # ── Attention slice ───────────────────────────────────────────────────────
-
+    
     def compute_attn_slice(
         self, block_idx: int, x: torch.Tensor, start_h: int, end_h: int
     ) -> torch.Tensor:
-        """
-        Computes the QKV projection for heads [start_h, end_h) of the given block.
-        Returns a (seq, 3 * len(heads) * head_dim) tensor on CPU.
-        """
+
         if start_h >= end_h:
             return torch.tensor([])
 
@@ -59,16 +56,34 @@ class CLIPWorker:
             x     = x.to(self.device)
             block = self.vision.encoder.layers[block_idx]
 
-            # CLIP: self_attn.in_proj_weight
-            attn_w = get_head_weights(
-                block.self_attn.in_proj_weight,
-                range(start_h, end_h),
-                self.meta["embed_dim"],
-                self.meta["head_dim"],
-            ).to(self.device)
+            # --- CLIP: separate projections ---
+            q_w = block.self_attn.q_proj.weight
+            k_w = block.self_attn.k_proj.weight
+            v_w = block.self_attn.v_proj.weight
 
-            return (x @ attn_w.t()).cpu()
+            q_b = block.self_attn.q_proj.bias
+            k_b = block.self_attn.k_proj.bias
+            v_b = block.self_attn.v_proj.bias
 
+            embed_dim = self.meta["embed_dim"]
+            head_dim  = self.meta["head_dim"]
+
+            qkv_slices = []
+
+            for proj_w, proj_b in [(q_w, q_b), (k_w, k_b), (v_w, v_b)]:
+                slices = []
+                for h in range(start_h, end_h):
+                    start = h * head_dim
+                    end   = start + head_dim
+                    w_slice = proj_w[start:end, :]
+                    b_slice = proj_b[start:end]
+                    slices.append(x @ w_slice.t() + b_slice)
+
+                if slices:
+                    qkv_slices.append(torch.cat(slices, dim=-1))
+
+            return torch.cat(qkv_slices, dim=-1).cpu() if qkv_slices else torch.tensor([])
+    
     # ── MLP slice ─────────────────────────────────────────────────────────────
 
     def compute_mlp_slice(

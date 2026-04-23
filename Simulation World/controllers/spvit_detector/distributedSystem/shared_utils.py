@@ -52,7 +52,7 @@ def get_model_metadata(model):
     else:
         seq_length = model.embeddings.position_embedding.weight.shape[0]
 
-    embed_dim = attn.in_proj_weight.shape[1]
+    embed_dim = attn.q_proj.weight.shape[1]
     num_heads = attn.num_heads
 
     return {
@@ -62,17 +62,6 @@ def get_model_metadata(model):
         "mlp_hidden_dim": mlp_weight.shape[0],
         "seq_length":     seq_length,
     }
-
-
-def get_head_weights(full_weight, head_indices, embed_dim, head_dim):
-    # Unchanged — in_proj_weight layout is identical in both torchvision and CLIP
-    slices = []
-    for i in [0, 1, 2]:
-        offset = i * embed_dim
-        for h in head_indices:
-            start = offset + h * head_dim
-            slices.append(full_weight[start:start + head_dim, :])
-    return torch.cat(slices, dim=0) if slices else torch.tensor([])
 
 
 def merge_n_projections(projections):
