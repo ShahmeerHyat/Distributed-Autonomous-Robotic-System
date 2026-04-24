@@ -14,8 +14,8 @@ if ball_node is None:
 
 # Movement Parameters
 forward_speed = 0.2  # Constant speed on X axis
-amplitude = 0.2      # How far it moves side-to-side (Z axis)
-frequency = 0.2      # Oscillations per second
+amplitude = 0      # How far it moves side-to-side (Z axis)
+frequency = 0      # Oscillations per second
 
 while robot.step(timestep) != -1:
     # Get the current simulation time
