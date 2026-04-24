@@ -299,9 +299,8 @@ class MasterOrchestrator:
                 w1       = fc1.weight[edge_n.start:edge_n.stop, :]
                 b1       = fc1.bias[edge_n.start:edge_n.stop]
                 w2       = fc2.weight[:, edge_n.start:edge_n.stop]
-                edge_mlp = torch.nn.functional.gelu(
-                    ln_x_mlp @ w1.t() + b1
-                ) @ w2.t()   # (1, S, D)
+                act_fn = block.mlp.activation_fn   # gets the correct quick_gelu from the loaded model
+                edge_mlp = act_fn(ln_x_mlp @ w1.t() + b1) @ w2.t()
             else:
                 edge_mlp = None
             raw_latency["edge"] += time.time() - t_edge
@@ -350,11 +349,6 @@ class MasterOrchestrator:
             #     f"Block {i:2d}  heads[edge={n_edge_h} worker={n_worker_h}]"
             #     f"  CB[{cb_str}]  →  {timing_str}"
             # )
-
-        # CLIP has a post-encoder layernorm that torchvision ViT does not
-        if hasattr(self.model, "post_layernorm"):
-            current_state = self.model.post_layernorm(current_state)
-
         return current_state
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
