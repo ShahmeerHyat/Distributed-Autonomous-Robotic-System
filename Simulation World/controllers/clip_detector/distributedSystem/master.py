@@ -183,7 +183,6 @@ class MasterOrchestrator:
         D  = self.meta["embed_dim"]
 
         for i, block in enumerate(self.model.encoder.layers):
-
             raw_latency = {dev: 0.0 for dev in self.all_devices}
             share_used  = {dev: 0.0 for dev in self.all_devices}
 
@@ -299,9 +298,11 @@ class MasterOrchestrator:
                 w1       = fc1.weight[edge_n.start:edge_n.stop, :]
                 b1       = fc1.bias[edge_n.start:edge_n.stop]
                 w2       = fc2.weight[:, edge_n.start:edge_n.stop]
-                edge_mlp = torch.nn.functional.gelu(
-                    ln_x_mlp @ w1.t() + b1
-                ) @ w2.t()   # (1, S, D)
+                # edge_mlp = torch.nn.functional.gelu(
+                #     ln_x_mlp @ w1.t() + b1
+                # ) @ w2.t()   # (1, S, D)
+                act_fn = block.mlp.activation_fn   # gets the correct quick_gelu from the loaded model
+                edge_mlp = act_fn(ln_x_mlp @ w1.t() + b1) @ w2.t()
             else:
                 edge_mlp = None
             raw_latency["edge"] += time.time() - t_edge
@@ -334,26 +335,22 @@ class MasterOrchestrator:
                     self.arima.notify_probe_result(w_name, PROBE_FAIL_LATENCY)
 
             # ── Status line ──────────────────────────────────────────────────
-            n_edge_h   = len(self.arima.get_indices("edge", H))
-            n_worker_h = sum(
-                len(self.arima.get_indices(w, H))
-                for w in self.expected_workers
-            )
-            cb_str     = ", ".join(
-                f"{w}={self.arima.breakers[w].state}" for w in self.expected_workers
-            )
-            timing_str = " | ".join(
-                f"{d}: {raw_latency[d]:.4f}s (share={share_used[d]:.2f})"
-                for d in self.all_devices
-            )
+            # n_edge_h   = len(self.arima.get_indices("edge", H))
+            # n_worker_h = sum(
+            #     len(self.arima.get_indices(w, H))
+            #     for w in self.expected_workers
+            # )
+            # cb_str     = ", ".join(
+            #     f"{w}={self.arima.breakers[w].state}" for w in self.expected_workers
+            # )
+            # timing_str = " | ".join(
+            #     f"{d}: {raw_latency[d]:.4f}s (share={share_used[d]:.2f})"
+            #     for d in self.all_devices
+            # )
             # print(
             #     f"Block {i:2d}  heads[edge={n_edge_h} worker={n_worker_h}]"
             #     f"  CB[{cb_str}]  →  {timing_str}"
             # )
-
-        # CLIP has a post-encoder layernorm that torchvision ViT does not
-        if hasattr(self.model, "post_layernorm"):
-            current_state = self.model.post_layernorm(current_state)
 
         return current_state
 

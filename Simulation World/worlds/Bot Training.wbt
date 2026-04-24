@@ -8,8 +8,8 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 WorldInfo {
 }
 Viewpoint {
-  orientation -0.131843966609186 0.026104548774603283 0.9909266980973065 2.754137327339099
-  position 0.9951553198695953 -0.3255944406383235 -0.1400895069281005
+  orientation -0.35450583639966854 0.3112146817793529 0.8817431790513309 1.8241462726110775
+  position -0.07925751415147936 -1.8761580099287722 1.5118118102201241
 }
 TexturedBackground {
 }
@@ -30,7 +30,7 @@ E-puck {
   camera_height 480
 }
 DEF TENNIS_BALL Robot {
-  translation 0.00858133 0.121363 -0.54015200154891
+  translation -0.511419 0.121363 -0.540152
   children [
     Shape {
       appearance Appearance {

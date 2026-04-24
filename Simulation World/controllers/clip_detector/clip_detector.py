@@ -67,7 +67,7 @@ print("[INIT] CLIP loaded successfully.")
 # Settings
 # ─────────────────────────────────────────────────────────────────────────────
 
-SEARCH_PROMPT        = "a round ball with black and white patches"
+SEARCH_PROMPT        = "ball"
 CENTER_TOL           = 0.01   # within ±1% → perfectly centred, drive straight
 ROTATE_ONLY_TOL      = 0.40   # beyond ±40% → spin in place, no forward motion
 CONFIDENCE_THRESHOLD = 20.0   # min similarity score (scaled ×100) to track
@@ -77,7 +77,7 @@ BASE_SPEED   = MAX_SPEED * 0.35
 TURN_GAIN    = MAX_SPEED * 0.80
 SEARCH_SPEED = MAX_SPEED * 0.30
 
-INFERENCE_EVERY_N = 1   # run CLIP every N Webots steps
+INFERENCE_EVERY_N = 5   # run CLIP every N Webots steps
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-compute patch grid  (7×7 = 49 spatial patches)
@@ -85,8 +85,6 @@ INFERENCE_EVERY_N = 1   # run CLIP every N Webots steps
 
 GRID_SIZE = 7
 _xs = torch.arange(GRID_SIZE).unsqueeze(0).repeat(GRID_SIZE, 1).flatten().float()
-# shape: (49,)  values: [0,0,0,0,0,0,0, 1,1,…, 6,6,6,6,6,6,6]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -100,7 +98,6 @@ def get_frame_as_pil(cam):
     h   = cam.getHeight()
     img = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
     return Image.fromarray(img[:, :, [2, 1, 0]])   # BGRA → RGB
-
 
 def get_clip_metadata(clip_model) -> dict:
     """Extract architecture constants from CLIP's vision config."""
@@ -152,25 +149,14 @@ orch = MasterOrchestrator(
     meta             = get_clip_metadata(model),
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pre-compute text embedding once  (cheap, local, done before the loop)
-#
-# CRITICAL: use model.get_text_features() — this applies text_projection
-# (maps 512 → 512 for ViT-B/32) so the text embedding lives in the same
-# 512-d joint space as the visual patches after visual_projection (768→512).
-# Using pooler_output directly skips text_projection → different space →
-# cosine similarities are garbage.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# with torch.no_grad():
-#     text_inputs = processor(text=[SEARCH_PROMPT], return_tensors="pt", padding=True)
-#     text_emb    = model.get_text_features(**text_inputs)   # (1, 512)
-#     text_emb    = text_emb / text_emb.norm(dim=-1, keepdim=True)
-
 with torch.no_grad():
     text_inputs = processor(text=[SEARCH_PROMPT], return_tensors="pt", padding=True)
+    # Extract the hidden state of the EOT token
     text_outputs = model.text_model(**text_inputs)
-    text_emb = text_outputs.pooler_output
+    pooled_output = text_outputs.pooler_output 
+    
+    # CRITICAL: Map the 768-d text vector into the 512-d joint space
+    text_emb = model.text_projection(pooled_output) 
     text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,48 +182,47 @@ while robot.step(timestep) != -1:
 
         if image is not None:
             with torch.no_grad():
-
-                # 1. Pre-process image
                 img_inputs   = processor(images=image, return_tensors="pt")
-                pixel_values = img_inputs["pixel_values"]   # (1, 3, 224, 224)
+                pixel_values = img_inputs["pixel_values"]
 
-                # 2. Patch embedding + CLS token + positional encoding
-                #    Both are cheap local ops — no reason to distribute them
-                hidden = model.vision_model.embeddings(pixel_values)  # (1, 50, 768)
+                hidden = model.vision_model.embeddings(pixel_values)
                 hidden = model.vision_model.pre_layrnorm(hidden)
 
-                # 3. Distributed encoder forward
-                #    Applies all 12 transformer blocks (+ post_layernorm inside)
-                #    Returns (1, 50, 768)
+                # 3. Distributed encoder forward (Returns raw last_hidden_state)
                 last_hidden = orch.run_inference(hidden)
 
-                # 4. Project patch tokens into the joint 512-d embedding space
-                #    Skip CLS (index 0), take the 49 spatial patches
-                patches   = last_hidden[:, 1:, :]                  # (1, 49, 768)
-                projected = model.visual_projection(patches)        # (1, 49, 512)
-                projected = projected / projected.norm(dim=-1, keepdim=True)
+                # 4. Official Pooling & Post-Norm (For the Global Score/Confidence)
+                cls_token = last_hidden[:, 0, :]
+                pooled_output = model.vision_model.post_layernorm(cls_token) # Norm ONLY the CLS
+                image_embeds = model.visual_projection(pooled_output)
+                image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
 
-                # 5. Per-patch cosine similarity with the text embedding
-                #    heatmap shape: (49,)
-                heatmap = torch.matmul(projected[0], text_emb.t()).squeeze()
+                # 5. Patch Processing (For the Heatmap/Centering)
+                # Official code doesn't explicitly norm patches for projection, but we do for heatmaps
+                patches = last_hidden[:, 1:, :] 
+                # Note: Usually, post_layernorm is applied to patches too if you want patch features
+                patches = model.vision_model.post_layernorm(patches) 
+                projected_patches = model.visual_projection(patches)
+                projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
 
-                # 6. Confidence score: mean similarity scaled to ~0–100
-                #    More stable than max (single noisy patch)
-                last_logits = projected[0].mean(dim=0) @ text_emb[0]
-                last_logits = last_logits.item() * 100.0
+                # 6. Similarity & Logit Scale
+                heatmap = torch.matmul(projected_patches[0], text_emb.t()).squeeze()
 
-                # 7. Spatial heatmap → lateral error
-                #    Temperature 0.01 sharpens the softmax for precise centering
-                weights  = torch.softmax(heatmap / 0.01, dim=0)   # (49,)
+                # Use the official logit scale instead of hardcoded 100
+                with torch.no_grad():
+                    scale = model.logit_scale.exp()
+                    
+                # Use the pooled global embedding for the confidence score (matches official CLIP output)
+                last_logits = (image_embeds @ text_emb.t()).item() * scale.item()
+                
+                weights  = torch.softmax(heatmap, dim=0)
                 center_x = (weights * _xs).sum().item()
-                center   = (GRID_SIZE - 1) / 2.0                   # 3.0
+                center   = (GRID_SIZE - 1) / 2.0                   
 
-                raw_error  = (center_x - center) / center          # −1 … +1
+                raw_error  = (center_x - center) / center
                 last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
-
-            print(f"[DEBUG] center_x={center_x:.2f}  "
-                  f"raw={raw_error:+.2f}  smooth={last_error:+.2f}  "
-                  f"score={last_logits:.2f}")
+                
+                top_val, top_idx = torch.topk(heatmap, 1)
 
     # ── Motor control ────────────────────────────────────────────────────────
 
@@ -250,8 +235,8 @@ while robot.step(timestep) != -1:
     else:
         # Not detected → spin to search; reset error so re-acquisition is clean
         last_error  = 0.0
-        left_speed  = -SEARCH_SPEED
-        right_speed =  SEARCH_SPEED
+        left_speed  = SEARCH_SPEED
+        right_speed = -SEARCH_SPEED
 
         if run_inference:
             print(f"[SEARCHING] score={last_logits:.2f}")
