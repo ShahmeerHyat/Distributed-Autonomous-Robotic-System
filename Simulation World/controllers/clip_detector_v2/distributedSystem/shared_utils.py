@@ -205,9 +205,9 @@ class CircuitBreaker:
 
 class MultiDeviceARIMAManager:
 
-    DROP_MULT   = 3.0
-    ADMIT_MULT  = 1.8
-    PROBE_SHARE = 0.08
+    DROP_MULT  = 6.0     # was 3.0
+    ADMIT_MULT = 3.0     # was 1.8
+    PROBE_SHARE = 0.15   # was 0.08
     EMA_ALPHA   = 0.35
     MAX_HISTORY = 24
 
@@ -290,12 +290,13 @@ class MultiDeviceARIMAManager:
 
         preds     = {dev: self._predict(dev) for dev in self.devices}
         edge_pred = preds.get("edge", 0.1)
-
+        edge_pred *= 1.5
         probe_devs  = []
         active_devs = {}
 
         for dev in self.devices:
             if dev == "edge":
+                
                 active_devs[dev] = 1.0 / preds[dev]
                 continue
 
