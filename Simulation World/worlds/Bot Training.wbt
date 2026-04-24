@@ -24,7 +24,7 @@ RectangleArena {
 E-puck {
   translation -0.729402 -0.00112018 -0.579147
   rotation 0.0011450503080943232 -0.00038823610446120913 0.9999992690659926 -2.831705307179586
-  controller "spvit_detector"
+  controller "clip_detector"
   camera_fieldOfView 0.8
   camera_width 640
   camera_height 480

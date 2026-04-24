@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
+from distributedSystem.master import MasterOrchestrator
 
 # ---------------------------
 # Initialize Robot
@@ -47,11 +48,11 @@ print("[INIT] CLIP loaded successfully.")
 # Settings
 # ---------------------------
 SEARCH_PROMPT        = "a round ball with black and white patches"
-CENTER_TOL           = 0.03 # ±15% of frame width → considered centred
+CENTER_TOL           = 0.01 # ±15% of frame width → considered centred
 ROTATE_ONLY_TOL      = 0.40 # If error is > 40%, stop moving forward and just spin
 CONFIDENCE_THRESHOLD = 20.0
 EMA_ALPHA            = 0.4
-EMP_CENTER           = 3.02 # empirically determined center_x value when object is perfectly centered (for error normalization)  
+EMP_CENTER           = 2.95 # empirically determined center_x value when object is perfectly centered (for error normalization)  
 
 # Drive constants
 BASE_SPEED  = MAX_SPEED * 0.35   # forward creep while centering
@@ -59,14 +60,14 @@ TURN_GAIN   = MAX_SPEED * 0.80   # steering authority
 SEARCH_SPEED = MAX_SPEED * 0.30  # spin speed when object not found
 
 # Frame-skip: run CLIP every N steps
-INFERENCE_EVERY_N = 3
+INFERENCE_EVERY_N = 5
 
 # ---------------------------
 # Pre-compute patch grid once
 # ---------------------------
 GRID_SIZE = 7
 _xs = torch.arange(GRID_SIZE).unsqueeze(0).repeat(GRID_SIZE, 1).flatten().float()
-print(f"[INIT] _XS grid pre-computed: {_xs.shape}  values={_xs.numpy()} ...")
+# print(f"[INIT] _XS grid pre-computed: {_xs.shape}  values={_xs.numpy()} ...")
 
 def get_frame_as_pil(cam):
     raw = cam.getImage()
@@ -76,7 +77,6 @@ def get_frame_as_pil(cam):
     h   = cam.getHeight()
     img = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
     return Image.fromarray(img[:, :, [2, 1, 0]])   # BGRA → RGB
-
 
 def compute_speeds(error):
     """
@@ -109,6 +109,16 @@ def compute_speeds(error):
     direction = "ARC_RIGHT" if error < 0 else "ARC_LEFT"
     return left_speed, right_speed, direction
 
+def get_clip_metadata(model):
+    # Extracts constants from the CLIP Vision Config
+    config = model.vision_model.config
+    return {
+        "num_heads": config.num_attention_heads,
+        "embed_dim": config.hidden_size,
+        "head_dim": config.hidden_size // config.num_attention_heads,
+        "mlp_hidden_dim": config.intermediate_size,
+        "seq_length": 50, # 49 patches + 1 class token
+    }
 
 # ---------------------------
 # Persistent state
@@ -122,8 +132,23 @@ print(f"[RUN] Searching for: '{SEARCH_PROMPT}'")
 # ---------------------------
 # Main Loop
 # ---------------------------
-while robot.step(timestep) != -1:
 
+orch = MasterOrchestrator(
+    expected_workers=["pc_gpu"],
+    host="0.0.0.0",            # Listen on all interfaces
+    port=29500,                # Default port
+    model=model.visual_model,  # The Vision Tower
+    meta=get_clip_metadata(model)             # The metadata dictionary
+)
+
+with torch.no_grad():
+    text_inputs = processor(text=[SEARCH_PROMPT], return_tensors="pt", padding=True)
+    # Use the model's get_text_features to get the normalized text embedding
+    text_embeds = model.get_text_features(**text_inputs)
+    text_emb_norm = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+
+while robot.step(timestep) != -1:
     step_count    += 1
     run_inference  = (step_count % INFERENCE_EVERY_N == 0)
 
@@ -134,35 +159,50 @@ while robot.step(timestep) != -1:
         image = get_frame_as_pil(camera)
 
         if image is not None:
-            inputs = processor(
-                text=[SEARCH_PROMPT],
-                images=image,
-                return_tensors="pt",
-                padding=True
-            )
+            # inputs = processor(
+            #     text=[SEARCH_PROMPT],
+            #     images=image,
+            #     return_tensors="pt",
+            #     padding=True
+            # )
 
+            # with torch.no_grad():
+            #     outputs = model(**inputs)
+            
+            # 1. Pre-process the image
+            inputs = processor(images=image, return_tensors="pt")
+            
+            # 2. RUN DISTRIBUTED INFERENCE
+            # returns raw tensor: [batch, 50_tokens, 768_dim]
             with torch.no_grad():
-                outputs = model(**inputs)
+                outputs = orch.run_inference(inputs['pixel_values'])
 
-            last_logits = outputs.logits_per_image.item()
-
-            # ── Spatial heatmap → lateral error ──────────────────────
-            patches   = outputs.vision_model_output.last_hidden_state[:, 1:, :]
+            # 3. FIX: ACCESS PATCHES DIRECTLY
+            # The orchestrator returns the hidden state. 
+            # [:, 1:, :] skips the CLS token and takes the 49 spatial patches.
+            patches = outputs[:, 1:, :] 
+            
+            # 4. Project and Normalize Patches
             projected = model.visual_projection(patches)
             projected = projected / projected.norm(dim=-1, keepdim=True)
 
-            text_emb  = outputs.text_embeds
-            text_emb  = text_emb / text_emb.norm(dim=-1, keepdim=True)
+            # 6. Heatmap Math
+            # Result: [49] similarity scores
+            heatmap = torch.matmul(projected[0], text_emb_norm.t()).squeeze()
+            
+            # FIX: Confidence proxy (since .logits_per_image is gone)
+            # We scale the max similarity to act as a confidence score
+            last_logits = heatmap.max().item() * 100 
 
-            heatmap  = torch.matmul(projected[0], text_emb.t()).squeeze()
-            weights  = torch.softmax(heatmap / 0.1, dim=0)
+            # FIX: Softmax Temperature (0.01 makes centering much more precise)
+            weights = torch.softmax(heatmap / 0.01, dim=0)
 
+            # 7. Spatial Calculations
             center_x  = (weights * _xs).sum().item()
-            # center    = (GRID_SIZE - 1) / 2
-            raw_error = (center_x - EMP_CENTER) / EMP_CENTER        # −1 (left) … +1 (right)
+            center    = (GRID_SIZE - 1) / 2
+            raw_error = (center_x - center) / center
 
-            # print(f"DEBUG: center_x={center_x:.2f} raw_error={raw_error}")
-            # EMA smoothing to reduce frame-to-frame jitter
+            print(f"DEBUG: center_x={center_x:.2f} raw_error={raw_error:+.2f}")
             last_error = raw_error
 
     # ---------------------------
@@ -181,6 +221,7 @@ while robot.step(timestep) != -1:
         right_speed = SEARCH_SPEED
 
         if run_inference:
+            
             print(f"[SEARCHING] score={last_logits:.2f}")
 
     left_motor.setVelocity(left_speed)

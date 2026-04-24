@@ -196,8 +196,10 @@ class MasterOrchestrator:
             for w_name in self.expected_workers:
                 h_range = self.arima.get_indices(w_name, self.meta["num_heads"])
                 if len(h_range) > 0:
-                    attn_futures[w_name] = self.executor.submit(self._dispatch_task, w_name, "ATTN", i, ln_x, h_range.start, h_range.stop)
-                    
+                    attn_futures[w_name] = self.executor.submit(
+                        self._dispatch_task, w_name, "ATTN", i,
+                        ln_x, h_range.start, h_range.stop,
+                    )
                     share_used[w_name] += self.arima.current_shares[w_name]
 
             edge_h = self.arima.get_indices("edge", self.meta["num_heads"])
