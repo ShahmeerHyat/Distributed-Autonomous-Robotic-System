@@ -96,29 +96,104 @@ class MasterOrchestrator:
         print("=" * 60)
         print("[Master] Pre-flight RTT measurement …")
 
+        # ── Step 1: Prime edge ONCE before touching any worker ──────────────
+        # Run 4 local-only forward passes to measure real edge latency.
+        # We use _local_inference() which bypasses the worker dispatch path
+        # entirely, so the timing reflects pure edge CPU compute.
+        print("[Master] Measuring edge baseline latency …")
+        dummy_edge = torch.randn(1, self.meta["seq_length"], self.meta["embed_dim"])
+        edge_times = []
+
+        for _ in range(4):
+            t0 = time.time()
+            self._local_inference(dummy_edge)
+            edge_times.append(time.time() - t0)
+
+        self.arima.prime_edge(edge_times, nominal_share=1.0)
+        print(f"  Edge latency samples: {[f'{t:.3f}s' for t in edge_times]}")
+        print(f"  Edge median: {sorted(edge_times)[2]:.3f}s")
+
+        # ── Step 2: RTT ping each worker and prime its history ───────────────
+        dummy_ping = torch.zeros(1, 1)
+
         for w_name, sock in self.sockets.items():
             samples = []
-            dummy   = torch.zeros(1, 1)
 
             for _ in range(PREFLIGHT_PINGS):
                 t0 = time.time()
-                send_msg(sock, ("PING", 0, dummy, 0, 0))
+                send_msg(sock, ("PING", 0, dummy_ping, 0, 0))
                 resp = recv_msg(sock)
                 rtt  = time.time() - t0
                 samples.append(rtt if resp is not None else PROBE_FAIL_LATENCY)
 
             med_rtt = sorted(samples)[len(samples) // 2]
             print(f"  {w_name}: RTTs={[f'{r:.3f}s' for r in samples]}  "
-                  f"→ median {med_rtt:.3f}s")
+                f"→ median {med_rtt:.3f}s")
 
             self.arima.prime(w_name, samples, nominal_share=0.5)
 
-            edge_guess = 0.05
-            if med_rtt / 0.5 > edge_guess * MultiDeviceARIMAManager.DROP_MULT:
+            # Pre-trip CB if worker is already clearly too slow.
+            # Compare against actual measured edge, not a hardcoded guess.
+            edge_median = sorted(edge_times)[len(edge_times) // 2]
+            edge_norm   = edge_median / 1.0   # share was 1.0 during edge timing
+            worker_norm = med_rtt / 2.0 / 0.5 # compute estimate / nominal share
+
+            if worker_norm > edge_norm * MultiDeviceARIMAManager.DROP_MULT:
                 print(f"  [Pre-flight] '{w_name}' already slow → pre-tripping CB")
                 self.arima.breakers[w_name].trip(reason="pre-flight RTT too high")
 
         print("[Master] Pre-flight complete.\n" + "=" * 60 + "\n")
+
+
+    def _local_inference(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Runs the full encoder forward pass locally on the edge device only.
+        No tasks are dispatched to workers. Used exclusively during preflight
+        to measure pure edge compute latency without network interference.
+        """
+        current_state = x
+
+        for block in self.model.encoder.layers:
+            ln_1 = block.layer_norm1
+            ln_2 = block.layer_norm2
+            attn = block.self_attn
+            fc1  = block.mlp.fc1
+            fc2  = block.mlp.fc2
+
+            # Full attention locally
+            identity = current_state
+            ln_x     = ln_1(current_state)
+            q = attn.q_proj(ln_x)
+            k = attn.k_proj(ln_x)
+            v = attn.v_proj(ln_x)
+
+            H  = self.meta["num_heads"]
+            hd = self.meta["head_dim"]
+            S  = self.meta["seq_length"]
+            D  = self.meta["embed_dim"]
+
+            def reshape(t):
+                return t.view(1, S, H, hd).transpose(1, 2)
+
+            scale      = hd ** -0.5
+            attn_probs = torch.softmax(
+                (reshape(q) @ reshape(k).transpose(-2, -1)) * scale, dim=-1
+            )
+            ctx           = (attn_probs @ reshape(v)).transpose(1, 2).reshape(1, S, D)
+            current_state = identity + attn.out_proj(ctx)
+
+            # Full MLP locally
+            identity      = current_state
+            ln_x_mlp      = ln_2(current_state)
+            mlp_out        = torch.nn.functional.gelu(
+                ln_x_mlp @ fc1.weight.t() + fc1.bias
+            ) @ fc2.weight.t() + fc2.bias
+            current_state  = identity + mlp_out
+
+        if hasattr(self.model, "post_layernorm"):
+            current_state = self.model.post_layernorm(current_state)
+
+        return current_state
 
     # ── Dispatch ────────────────────────────────────────────────────────────
 

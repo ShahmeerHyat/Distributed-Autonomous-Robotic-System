@@ -151,7 +151,6 @@ def merge_n_projections(projections):
 # ─────────────────────────────────────────────────────────────────────────────
 # Circuit Breaker
 # ─────────────────────────────────────────────────────────────────────────────
-
 class CircuitBreaker:
     CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
 
@@ -199,17 +198,21 @@ class CircuitBreaker:
     def is_closed(self)    -> bool: return self.state == self.CLOSED
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MultiDeviceARIMAManager
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MultiDeviceARIMAManager:
 
-    DROP_MULT  = 6.0     # was 3.0
-    ADMIT_MULT = 3.0     # was 1.8
-    PROBE_SHARE = 0.15   # was 0.08
-    EMA_ALPHA   = 0.35
+    # Hysteresis gap: trip at 3×, re-admit only below 1.8×.
+    # The gap prevents oscillation — once dropped, the bar to return
+    # is meaningfully lower than the bar that caused the drop.
+    DROP_MULT   = 3.0
+    ADMIT_MULT  = 1.8
+    PROBE_SHARE = 0.10   # share given to HALF_OPEN device during probe
+    EMA_ALPHA   = 0.35   # smoothing on healthy share transitions
     MAX_HISTORY = 24
+
+    # Minimum share a CLOSED worker always receives so its history
+    # keeps updating and the death spiral (zero share → no data →
+    # stale prediction → zero share) cannot occur.
+    MIN_WORKER_SHARE = 0.10
 
     def __init__(
         self,
@@ -237,12 +240,46 @@ class MultiDeviceARIMAManager:
     # ── Pre-flight ─────────────────────────────────────────────────────────
 
     def prime(self, device_id: str, rtt_samples: list, nominal_share: float = 0.5):
+        """
+        Seed a worker's normalized latency history from preflight RTTs.
+        RTT includes network round-trip. We subtract an estimated one-way
+        transmission time so the seeded value reflects compute latency only,
+        making it comparable to the edge's pure-compute latency.
+
+        estimated_compute ≈ (rtt / 2) is a conservative lower bound.
+        Divide by nominal_share to normalize.
+        """
         for rtt in rtt_samples:
-            self.norm_history[device_id].append(rtt / nominal_share)
+            # Use half the RTT as a compute-only estimate (subtracts one-way
+            # network transit). This prevents the worker from starting with
+            # an inflated normalized latency purely due to network overhead.
+            compute_estimate = rtt / 2.0
+            self.norm_history[device_id].append(compute_estimate / nominal_share)
+
+    def prime_edge(self, latency_samples: list, nominal_share: float = 1.0):
+        """
+        Seed the edge device's normalized latency history from measured
+        local inference times. Call this after a few warm-up inference
+        passes before connecting workers, so ARIMA starts with a realistic
+        edge baseline rather than the default 0.1ms.
+        """
+        for lat in latency_samples:
+            self.norm_history["edge"].append(lat / nominal_share)
 
     # ── Latency recording ──────────────────────────────────────────────────
 
     def record_block_latency(self, device_id: str, latency: float, share_used: float):
+        """
+        Record normalized latency (latency / share_used) for a device.
+
+        If the device is OPEN (CB tripped), inject synthetic upward-drifting
+        history so ARIMA cannot drift toward optimism without real evidence.
+
+        If share_used is zero (worker was skipped this block), do NOT return
+        early — instead record nothing but do not corrupt state. The history
+        stays at its last value, which is appropriate since no new information
+        arrived.
+        """
         if device_id in self.breakers and self.breakers[device_id].is_open:
             h = self.norm_history[device_id]
             if h:
@@ -251,6 +288,7 @@ class MultiDeviceARIMAManager:
                     h.pop(0)
             return
 
+        # No work was dispatched this block — history unchanged, no update.
         if share_used <= 0.0:
             return
 
@@ -269,9 +307,24 @@ class MultiDeviceARIMAManager:
     # ── ARIMA prediction ───────────────────────────────────────────────────
 
     def _predict(self, dev: str) -> float:
+        """
+        Differenced moving average predictor (ARIMA-V approximation).
+
+        With fewer than p+d samples, falls back to the mean of available
+        history. With sufficient history, computes:
+            pred = last_value + mean(recent_differences) + 0.1 * last_residual
+
+        This is a first-order drift estimator, not a full ARIMA(p,d,q) fit,
+        but it captures trending latency changes (e.g., thermal throttling,
+        network congestion building up) which is the core requirement.
+        """
         h = self.norm_history[dev]
+        if not h:
+            # No history at all — return a neutral estimate
+            return 0.1
+
         if len(h) < self.p + self.d:
-            pred = float(np.mean(h)) if h else 0.1
+            pred = float(np.mean(h))
         else:
             diffs  = [h[i] - h[i - 1] for i in range(1, len(h))]
             ar_val = float(np.mean(diffs[-self.p:]))
@@ -285,18 +338,29 @@ class MultiDeviceARIMAManager:
     # ── Share update ───────────────────────────────────────────────────────
 
     def update_shares(self) -> dict:
+        """
+        Compute new shares for the upcoming block.
+
+        Key design decisions:
+        - edge_pred is used raw, with no artificial multiplier.
+        - CLOSED workers below DROP_MULT threshold are always active.
+        - Any CLOSED worker whose computed share would fall below
+          MIN_WORKER_SHARE is floored at MIN_WORKER_SHARE to prevent
+          the zero-share death spiral (no share → no data → stale
+          prediction → no share).
+        - Drops are applied instantly; healthy transitions are EMA-smoothed.
+        """
         for cb in self.breakers.values():
             cb.tick()
 
         preds     = {dev: self._predict(dev) for dev in self.devices}
-        edge_pred = preds.get("edge", 0.1)
-        edge_pred *= 1.5
+        edge_pred = preds.get("edge", 0.1)   # raw, no artificial inflation
+
         probe_devs  = []
         active_devs = {}
 
         for dev in self.devices:
             if dev == "edge":
-                
                 active_devs[dev] = 1.0 / preds[dev]
                 continue
 
@@ -305,17 +369,30 @@ class MultiDeviceARIMAManager:
 
             if cb.is_open:
                 continue
+
             elif cb.is_half_open:
                 probe_devs.append(dev)
+
             elif pred > edge_pred * self.DROP_MULT:
                 print(f"\n  [ARIMA] ⚠️  '{dev}': norm_pred={pred:.3f}s "
                       f"vs edge={edge_pred:.3f}s (>{self.DROP_MULT}×) → tripping CB")
-                cb.trip(reason=f"norm_pred {pred:.2f}s > {self.DROP_MULT}× edge {edge_pred:.2f}s")
+                cb.trip(
+                    reason=f"norm_pred {pred:.2f}s > "
+                           f"{self.DROP_MULT}× edge {edge_pred:.2f}s"
+                )
+
             elif pred > edge_pred * self.ADMIT_MULT:
-                print(f"  [ARIMA] '{dev}' marginal ({pred:.3f}s vs edge {edge_pred:.3f}s). Skipping.")
+                # Marginal: exclude this block but do not trip.
+                # Still give it MIN_WORKER_SHARE so history keeps updating.
+                print(f"  [ARIMA] '{dev}' marginal "
+                      f"({pred:.3f}s vs edge {edge_pred:.3f}s). "
+                      f"Assigning floor share to preserve history.")
+                active_devs[dev] = 1.0 / pred   # small score → small share
+
             else:
                 active_devs[dev] = 1.0 / pred
 
+        # ── Allocate shares ──────────────────────────────────────────────
         probe_reserved = len(probe_devs) * self.PROBE_SHARE
         remaining      = max(0.0, 1.0 - probe_reserved)
         total_score    = sum(active_devs.values()) or 1.0
@@ -326,18 +403,37 @@ class MultiDeviceARIMAManager:
         for dev in probe_devs:
             target[dev] = self.PROBE_SHARE
 
+        # ── Floor: CLOSED workers always get at least MIN_WORKER_SHARE ──
+        # This breaks the death spiral. If ARIMA assigns a worker less than
+        # the floor, we bring it up and reduce edge proportionally.
+        for dev in self.devices:
+            if dev == "edge" or dev not in self.breakers:
+                continue
+            if self.breakers[dev].is_closed and 0 < target[dev] < self.MIN_WORKER_SHARE:
+                deficit = self.MIN_WORKER_SHARE - target[dev]
+                target[dev]      = self.MIN_WORKER_SHARE
+                target["edge"]   = max(0.0, target.get("edge", 0.0) - deficit)
+
+        # ── Apply EMA on healthy transitions, instant drop to zero ───────
         for dev in self.devices:
             t = target[dev]
             if t == 0.0:
                 self.current_shares[dev] = 0.0
             else:
                 prev = self.current_shares[dev]
-                self.current_shares[dev] = self.EMA_ALPHA * t + (1.0 - self.EMA_ALPHA) * prev
+                self.current_shares[dev] = (
+                    self.EMA_ALPHA * t + (1.0 - self.EMA_ALPHA) * prev
+                )
 
+        # ── Hard zero below min threshold (but floor overrides this) ─────
         for dev in self.devices:
             if dev != "edge" and 0 < self.current_shares[dev] < self.min_share_threshold:
-                self.current_shares[dev] = 0.0
+                # Only zero out if the target was also below floor,
+                # meaning the worker is genuinely assigned nothing.
+                if target[dev] < self.MIN_WORKER_SHARE:
+                    self.current_shares[dev] = 0.0
 
+        # ── Re-normalise to sum to 1.0 ───────────────────────────────────
         total = sum(self.current_shares.values())
         if total > 0:
             for dev in self.devices:
