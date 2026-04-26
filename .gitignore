@@ -1,0 +1,4 @@
+*.pyc
+*.pt
+/Clip Model
+/yolo_venv
