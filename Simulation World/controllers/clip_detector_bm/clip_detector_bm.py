@@ -72,11 +72,11 @@ ROTATE_ONLY_TOL      = 0.40
 CONFIDENCE_THRESHOLD = 20
 EMA_ALPHA            = 0.4
 
-BASE_SPEED   = MAX_SPEED * 0.9
+BASE_SPEED   = MAX_SPEED
 TURN_GAIN    = MAX_SPEED * 0.80
-SEARCH_SPEED = MAX_SPEED * 0.6
+SEARCH_SPEED = MAX_SPEED * 0.60
 
-INFERENCE_EVERY_N        = 1
+INFERENCE_EVERY_N        = 5
 BENCHMARK_AFTER_N_FRAMES = 500
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,8 +206,8 @@ while robot.step(timestep) != -1:
                 last_hidden = orch.run_inference(hidden)
                 inf_lat     = time.perf_counter() - t0
 
-                # CLS token → confidence score
-                cls_token   = last_hidden[:, 0, :]
+                # 4. Official Pooling & Post-Norm (For the Global Score/Confidence)
+                cls_token = last_hidden[:, 0, :]
                 pooled_output = model.vision_model.post_layernorm(cls_token) # Norm ONLY the CLS
                 image_embeds = model.visual_projection(pooled_output)
                 image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
@@ -226,17 +226,17 @@ while robot.step(timestep) != -1:
                 # Use the official logit scale instead of hardcoded 100
                 with torch.no_grad():
                     scale = model.logit_scale.exp()
-                    
+
                 # Use the pooled global embedding for the confidence score (matches official CLIP output)
                 last_logits = (image_embeds @ text_emb.t()).item() * scale.item()
-                
-                weights  = torch.softmax(heatmap, dim=0)
-                center_x = (weights * _xs).sum().item()
-                center   = (GRID_SIZE - 1) / 2.0                   
 
-                raw_error  = (center_x - center) / center
+                weights  = torch.softmax(heatmap / 0.1, dim=0)
+                center_x = (weights * _xs).sum().item()
+                center   = (GRID_SIZE - 1) / 2.0
+
+                raw_error  = (center_x - 3) / 3
                 last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
-                
+
                 top_val, top_idx = torch.topk(heatmap, 1)
 
             # Push to benchmark collector
