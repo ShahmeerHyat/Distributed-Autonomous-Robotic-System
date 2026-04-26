@@ -44,23 +44,16 @@ class MasterOrchestrator:
         host: str   = "0.0.0.0",
         port: int   = 29500,
         model       = None,   # pass clip.vision_model from the detector
-        meta: dict  = None,   # pass get_clip_metadata() result from detector
+        meta:dict        = {},   # pass get_clip_metadata() result from detector
     ):
         self.expected_workers = expected_workers
         self.all_devices      = ["edge"] + expected_workers
         self.arima            = MultiDeviceARIMAManager(self.all_devices)
-
+        self.last_inference_stats = {}
         # ── Model ─────────────────────────────────────────────────────────
-        if model is not None:
-            self.model = model
-        else:
-            # Standalone / __main__ mode
-            clip       = CLIPModel.from_pretrained(
-                MODEL_PATH, local_files_only=True
-            ).eval()
-            self.model = clip.vision_model
 
-        self.meta = meta or get_model_metadata(self.model)
+        self.model = model
+        self.meta = meta
 
         # ── Network ───────────────────────────────────────────────────────
         self.sockets: dict = {}
@@ -96,10 +89,10 @@ class MasterOrchestrator:
         print("=" * 60)
         print("[Master] Pre-flight RTT measurement …")
 
-        # ── Step 1: Prime edge ONCE before touching any worker ──────────────
-        # Run 4 local-only forward passes to measure real edge latency.
-        # We use _local_inference() which bypasses the worker dispatch path
-        # entirely, so the timing reflects pure edge CPU compute.
+        # # ── Step 1: Prime edge ONCE before touching any worker ──────────────
+        # # Run 4 local-only forward passes to measure real edge latency.
+        # # We use _local_inference() which bypasses the worker dispatch path
+        # # entirely, so the timing reflects pure edge CPU compute.
         print("[Master] Measuring edge baseline latency …")
         dummy_edge = torch.randn(1, self.meta["seq_length"], self.meta["embed_dim"])
         edge_times = []
@@ -113,7 +106,7 @@ class MasterOrchestrator:
         print(f"  Edge latency samples: {[f'{t:.3f}s' for t in edge_times]}")
         print(f"  Edge median: {sorted(edge_times)[2]:.3f}s")
 
-        # ── Step 2: RTT ping each worker and prime its history ───────────────
+        # # ── Step 2: RTT ping each worker and prime its history ───────────────
         dummy_ping = torch.zeros(1, 1)
 
         for w_name, sock in self.sockets.items():
@@ -242,132 +235,122 @@ class MasterOrchestrator:
     # ── Inference ────────────────────────────────────────────────────────────
 
     def run_inference(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Block-by-block distributed forward through clip.vision_model.encoder.layers.
-
-        x : (1, seq_length, embed_dim)  — output of vision.embeddings + pre_layernorm
-            (both applied in clip_detector.py before calling this)
-
-        Returns last hidden state (1, seq_length, embed_dim).
-        The caller is responsible for applying vision_model.post_layernorm afterwards.
-        """
+    
         current_state = x
         H  = self.meta["num_heads"]
         hd = self.meta["head_dim"]
         S  = self.meta["seq_length"]
         D  = self.meta["embed_dim"]
-
+    
+        # ← NEW: reset per-inference stat accumulators
+        _blk_attn_ms   = []
+        _blk_mlp_ms    = []
+        _blk_arima_us  = []
+    
         for i, block in enumerate(self.model.encoder.layers):
-
+    
             raw_latency = {dev: 0.0 for dev in self.all_devices}
             share_used  = {dev: 0.0 for dev in self.all_devices}
-
+    
             probing_workers = {
                 w for w in self.expected_workers
                 if w in self.arima.breakers and self.arima.breakers[w].is_half_open
             }
-
+    
+            # ← NEW: time the ARIMA update call
+            _t_arima = time.perf_counter()
             self.arima.update_shares()
-
-            # CLIP block attribute names (no torchvision fallbacks needed)
+            _blk_arima_us.append((time.perf_counter() - _t_arima) * 1e6)
+    
             ln_1 = block.layer_norm1
             ln_2 = block.layer_norm2
-            attn = block.self_attn    # CLIPAttention
+            attn = block.self_attn
             fc1  = block.mlp.fc1
             fc2  = block.mlp.fc2
-
-            # ── ATTENTION ───────────────────────────────────────────────────
+    
+            # ── ATTENTION ─────────────────────────────────────────────────────────
+            # ← NEW: start ATTN timer
+            _t_attn = time.perf_counter()
+    
             identity = current_state
-            ln_x     = ln_1(current_state)   # (1, S, D)
-
-            # Project Q, K, V for the full sequence once (cheap, local)
-            # Each: (1, S, D)
+            ln_x     = ln_1(current_state)
+    
             q_full = attn.q_proj(ln_x)
             k_full = attn.k_proj(ln_x)
             v_full = attn.v_proj(ln_x)
-
-            # ── Dispatch head slices to workers in parallel ──────────────
+    
             attn_futures = {}
             for w_name in self.expected_workers:
                 h_range = self.arima.get_indices(w_name, H)
                 if len(h_range) > 0:
-                    # Slice into (B, H_slice, S, head_dim) — ready for math
                     q_s = to_head_space(q_full, h_range, H, hd)
                     k_s = to_head_space(k_full, h_range, H, hd)
                     v_s = to_head_space(v_full, h_range, H, hd)
-
                     attn_futures[w_name] = self.executor.submit(
-                        self._dispatch_task,
-                        w_name, "ATTN", i,
-                        (q_s, k_s, v_s),   # tuple payload — the only valid ATTN form
+                        self._dispatch_task, w_name, "ATTN", i, (q_s, k_s, v_s),
                     )
                     share_used[w_name] += self.arima.current_shares[w_name]
-
-            # ── Edge computes its own head slice locally ──────────────────
+    
             edge_h = self.arima.get_indices("edge", H)
             share_used["edge"] += self.arima.current_shares["edge"]
-
+    
             t_edge = time.time()
             if len(edge_h) > 0:
-                q_e = to_head_space(q_full, edge_h, H, hd)   # (1, H_e, S, hd)
+                q_e = to_head_space(q_full, edge_h, H, hd)
                 k_e = to_head_space(k_full, edge_h, H, hd)
                 v_e = to_head_space(v_full, edge_h, H, hd)
-
                 scale      = hd ** -0.5
                 attn_probs = torch.softmax(
                     (q_e @ k_e.transpose(-2, -1)) * scale, dim=-1
-                )                                              # (1, H_e, S, S)
-                edge_attn  = attn_probs @ v_e                 # (1, H_e, S, hd)
+                )
+                edge_attn  = attn_probs @ v_e
             else:
                 edge_attn = None
             raw_latency["edge"] += time.time() - t_edge
-
-            # ── Collect worker results and merge all head outputs ─────────
-            # Iterate in self.all_devices order so head indices stay sorted.
+    
             head_parts = []
             for dev in self.all_devices:
                 if dev == "edge":
                     if edge_attn is not None:
                         head_parts.append(edge_attn)
                 elif dev in attn_futures:
-                    res, lat = attn_futures[dev].result()   # (1, H_w, S, hd)
+                    res, lat = attn_futures[dev].result()
                     raw_latency[dev] += lat
                     if res is not None and res.numel() > 0:
                         head_parts.append(res.to(ln_x.device))
                     else:
-                        # Worker failed — fill with zeros to preserve shape
                         h_range = self.arima.get_indices(dev, H)
                         if len(h_range) > 0:
                             head_parts.append(
-                                torch.zeros(1, len(h_range), S, hd,
-                                            device=ln_x.device)
+                                torch.zeros(1, len(h_range), S, hd, device=ln_x.device)
                             )
-
-            # Concatenate on head dim → (1, H_total, S, hd)
-            ctx = torch.cat(head_parts, dim=1)
-            # Reshape to (1, S, embed_dim) for out_proj
-            ctx      = ctx.transpose(1, 2).reshape(1, S, D)
+    
+            ctx      = torch.cat(head_parts, dim=1).transpose(1, 2).reshape(1, S, D)
             attn_out = attn.out_proj(ctx)
-
             current_state = identity + attn_out
-
-            # ── MLP ─────────────────────────────────────────────────────────
+    
+            # ← NEW: stop ATTN timer
+            _blk_attn_ms.append((time.perf_counter() - _t_attn) * 1e3)
+    
+            # ── MLP ───────────────────────────────────────────────────────────────
+            # ← NEW: start MLP timer
+            _t_mlp = time.perf_counter()
+    
             identity  = current_state
             ln_x_mlp  = ln_2(current_state)
-
+    
             mlp_futures = {}
             for w_name in self.expected_workers:
                 n_range = self.arima.get_indices(w_name, self.meta["mlp_hidden_dim"])
                 if len(n_range) > 0:
                     mlp_futures[w_name] = self.executor.submit(
-                        self._dispatch_task,
-                        w_name, "MLP", i,
+                        self._dispatch_task, w_name, "MLP", i,
                         ln_x_mlp, n_range.start, n_range.stop,
                     )
                     share_used[w_name] = (
                         share_used[w_name] + self.arima.current_shares[w_name]
                     ) / 2.0
-
+    
             edge_n = self.arima.get_indices("edge", self.meta["mlp_hidden_dim"])
             t_edge = time.time()
             if len(edge_n) > 0:
@@ -379,51 +362,42 @@ class MasterOrchestrator:
             else:
                 edge_mlp = None
             raw_latency["edge"] += time.time() - t_edge
-
+    
             mlp_parts = [edge_mlp] if edge_mlp is not None else []
             for w_name, fut in mlp_futures.items():
                 res, lat = fut.result()
                 raw_latency[w_name] += lat
                 if res is not None and res.numel() > 0:
                     mlp_parts.append(res.to(ln_x_mlp.device))
-
-            # fc2.bias is embed-dim wide — add once after summing all slices
+    
             mlp_final     = sum_mlp_parts(mlp_parts) + fc2.bias
             current_state = identity + mlp_final
-
-            # ── ARIMA bookkeeping ────────────────────────────────────────────
+    
+            # ← NEW: stop MLP timer
+            _blk_mlp_ms.append((time.perf_counter() - _t_mlp) * 1e3)
+    
+            # ── ARIMA bookkeeping (unchanged) ──────────────────────────────────
             for dev in self.all_devices:
                 s = share_used[dev]
-                self.arima.record_block_latency(
-                    dev, raw_latency[dev], s if s > 0 else 0.0
-                )
-
+                self.arima.record_block_latency(dev, raw_latency[dev], s if s > 0 else 0.0)
+    
             for w_name in probing_workers:
                 s = share_used.get(w_name, 0.0)
                 if s > 0 and raw_latency[w_name] < PROBE_FAIL_LATENCY:
-                    self.arima.notify_probe_result(
-                        w_name, raw_latency[w_name] / s
-                    )
+                    self.arima.notify_probe_result(w_name, raw_latency[w_name] / s)
                 else:
                     self.arima.notify_probe_result(w_name, PROBE_FAIL_LATENCY)
-
-            # ── Status line ──────────────────────────────────────────────────
-            n_edge_h   = len(self.arima.get_indices("edge", H))
-            n_worker_h = sum(
-                len(self.arima.get_indices(w, H))
-                for w in self.expected_workers
-            )
-            cb_str     = ", ".join(
-                f"{w}={self.arima.breakers[w].state}" for w in self.expected_workers
-            )
-            timing_str = " | ".join(
-                f"{d}: {raw_latency[d]:.4f}s (share={share_used[d]:.2f})"
-                for d in self.all_devices
-            )
-            # print(
-            #     f"Block {i:2d}  heads[edge={n_edge_h} worker={n_worker_h}]"
-            #     f"  CB[{cb_str}]  →  {timing_str}"
-            # )
+    
+        # if hasattr(self.model, "post_layernorm"):
+        #     current_state = self.model.post_layernorm(current_state)
+    
+        # ← NEW: store all per-block stats for BenchmarkCollector to read
+        self.last_inference_stats = {
+            "per_block_attn_ms":  _blk_attn_ms,
+            "per_block_mlp_ms":   _blk_mlp_ms,
+            "arima_overhead_us":  _blk_arima_us,
+        }
+    
         return current_state
 
     # ── Shutdown ─────────────────────────────────────────────────────────────

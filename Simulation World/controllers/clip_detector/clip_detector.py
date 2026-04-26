@@ -67,7 +67,7 @@ print("[INIT] CLIP loaded successfully.")
 # Settings
 # ─────────────────────────────────────────────────────────────────────────────
 
-SEARCH_PROMPT        = "ball"
+SEARCH_PROMPT        = "a round ball with black and white patches"
 CENTER_TOL           = 0.01   # within ±1% → perfectly centred, drive straight
 ROTATE_ONLY_TOL      = 0.40   # beyond ±40% → spin in place, no forward motion
 CONFIDENCE_THRESHOLD = 20.0   # min similarity score (scaled ×100) to track
@@ -75,9 +75,9 @@ EMA_ALPHA            = 0.4    # lateral error smoothing  (0 = no smoothing)
 
 BASE_SPEED   = MAX_SPEED * 0.35
 TURN_GAIN    = MAX_SPEED * 0.80
-SEARCH_SPEED = MAX_SPEED * 0.30
+SEARCH_SPEED = MAX_SPEED * 0.60
 
-INFERENCE_EVERY_N = 5   # run CLIP every N Webots steps
+INFERENCE_EVERY_N = 1   # run CLIP every N Webots steps
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-compute patch grid  (7×7 = 49 spatial patches)
@@ -109,7 +109,6 @@ def get_clip_metadata(clip_model) -> dict:
         "mlp_hidden_dim": cfg.intermediate_size,
         "seq_length":     50,   # 49 patches + 1 CLS for ViT-B/32
     }
-
 
 def compute_speeds(error: float):
     """
@@ -229,17 +228,17 @@ while robot.step(timestep) != -1:
     if last_logits > CONFIDENCE_THRESHOLD:
         left_speed, right_speed, state_label = compute_speeds(last_error)
 
-        if run_inference:
-            print(f"[FOUND]     score={last_logits:.2f}  "
-                  f"error={last_error:+.2f}  → {state_label}")
+        # if run_inference:
+        #     print(f"[FOUND]     score={last_logits:.2f}  "
+        #           f"error={last_error:+.2f}  → {state_label}")
     else:
         # Not detected → spin to search; reset error so re-acquisition is clean
         last_error  = 0.0
         left_speed  = SEARCH_SPEED
         right_speed = -SEARCH_SPEED
 
-        if run_inference:
-            print(f"[SEARCHING] score={last_logits:.2f}")
+        # if run_inference:
+        #     print(f"[SEARCHING] score={last_logits:.2f}")
 
     left_motor.setVelocity(left_speed)
     right_motor.setVelocity(right_speed)

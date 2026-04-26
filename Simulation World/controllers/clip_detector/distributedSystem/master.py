@@ -44,23 +44,15 @@ class MasterOrchestrator:
         host: str   = "0.0.0.0",
         port: int   = 29500,
         model       = None,   # pass clip.vision_model from the detector
-        meta: dict  = None,   # pass get_clip_metadata() result from detector
+        meta:dict        = {},   # pass get_clip_metadata() result from detector
     ):
         self.expected_workers = expected_workers
         self.all_devices      = ["edge"] + expected_workers
         self.arima            = MultiDeviceARIMAManager(self.all_devices)
-
+        self.last_inference_stats = {}
         # ── Model ─────────────────────────────────────────────────────────
-        if model is not None:
-            self.model = model
-        else:
-            # Standalone / __main__ mode
-            clip       = CLIPModel.from_pretrained(
-                MODEL_PATH, local_files_only=True
-            ).eval()
-            self.model = clip.vision_model
-
-        self.meta = meta or get_model_metadata(self.model)
+        self.model = model
+        self.meta = meta
 
         # ── Network ───────────────────────────────────────────────────────
         self.sockets: dict = {}
@@ -268,9 +260,9 @@ class MasterOrchestrator:
                             )
 
             # Concatenate on head dim → (1, H_total, S, hd)
-            ctx = torch.cat(head_parts, dim=1)
             # Reshape to (1, S, embed_dim) for out_proj
-            ctx      = ctx.transpose(1, 2).reshape(1, S, D)
+            
+            ctx = torch.cat(head_parts, dim=1).transpose(1, 2).reshape(1, S, D)
             attn_out = attn.out_proj(ctx)
 
             current_state = identity + attn_out

@@ -24,9 +24,9 @@ RectangleArena {
 E-puck {
   translation -0.729402 -0.00112018 -0.579147
   rotation 0.0012559402260501917 0.0002502880450480519 0.9999991799846852 2.40428
-  controller "clip_detector_bm"
+  controller "clip_detector"
   camera_fieldOfView 0.8
-  camera_width 640
+  camera_width 480
   camera_height 480
 }
 DEF TENNIS_BALL Robot {

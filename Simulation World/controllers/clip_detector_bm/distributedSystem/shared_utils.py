@@ -169,23 +169,23 @@ class CircuitBreaker:
             self.max_cooldown,
         )
         self.blocks_remaining = cooldown
-        tag = f" ({reason})" if reason else ""
-        print(f"  [CB] ⚡ Tripped{tag}. Cooldown = {cooldown} blocks "
-              f"(trip #{self.consecutive_trips})")
+        # tag = f" ({reason})" if reason else ""
+        # print(f"  [CB] ⚡ Tripped{tag}. Cooldown = {cooldown} blocks "
+        #       f"(trip #{self.consecutive_trips})")
 
     def tick(self) -> bool:
         if self.state == self.OPEN:
             self.blocks_remaining -= 1
             if self.blocks_remaining <= 0:
                 self.state = self.HALF_OPEN
-                print("  [CB] 🔍 Cooldown elapsed → HALF_OPEN (probing next block)")
+                # print("  [CB] 🔍 Cooldown elapsed → HALF_OPEN (probing next block)")
                 return True
         return False
 
     def on_probe_success(self):
         self.state             = self.CLOSED
         self.consecutive_trips = 0
-        print("  [CB] ✅ Probe succeeded → CLOSED")
+        # print("  [CB] ✅ Probe succeeded → CLOSED")
 
     def on_probe_failure(self, reason: str = ""):
         self.trip(reason=f"probe failed: {reason}" if reason else "probe failed")
