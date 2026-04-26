@@ -73,11 +73,11 @@ ROTATE_ONLY_TOL      = 0.40   # beyond ±40% → spin in place, no forward motio
 CONFIDENCE_THRESHOLD = 20.0   # min similarity score (scaled ×100) to track
 EMA_ALPHA            = 0.4    # lateral error smoothing  (0 = no smoothing)
 
-BASE_SPEED   = MAX_SPEED * 0.35
+BASE_SPEED   = MAX_SPEED
 TURN_GAIN    = MAX_SPEED * 0.80
 SEARCH_SPEED = MAX_SPEED * 0.60
 
-INFERENCE_EVERY_N = 1   # run CLIP every N Webots steps
+INFERENCE_EVERY_N = 5   # run CLIP every N Webots steps
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-compute patch grid  (7×7 = 49 spatial patches)
@@ -210,17 +210,17 @@ while robot.step(timestep) != -1:
                 # Use the official logit scale instead of hardcoded 100
                 with torch.no_grad():
                     scale = model.logit_scale.exp()
-                    
+
                 # Use the pooled global embedding for the confidence score (matches official CLIP output)
                 last_logits = (image_embeds @ text_emb.t()).item() * scale.item()
-                
-                weights  = torch.softmax(heatmap, dim=0)
-                center_x = (weights * _xs).sum().item()
-                center   = (GRID_SIZE - 1) / 2.0                   
 
-                raw_error  = (center_x - center) / center
+                weights  = torch.softmax(heatmap / 0.1, dim=0)
+                center_x = (weights * _xs).sum().item()
+                center   = (GRID_SIZE - 1) / 2.0
+
+                raw_error  = (center_x - 3) / 3
                 last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
-                
+
                 top_val, top_idx = torch.topk(heatmap, 1)
 
     # ── Motor control ────────────────────────────────────────────────────────
