@@ -70,7 +70,7 @@ SEARCH_PROMPT        = "a round ball with black and white patches"
 CENTER_TOL           = 0.01
 ROTATE_ONLY_TOL      = 0.40
 CONFIDENCE_THRESHOLD = 20
-EMA_ALPHA            = 0.4
+EMA_ALPHA            = 0.4git 
 
 BASE_SPEED   = MAX_SPEED
 TURN_GAIN    = MAX_SPEED * 0.80
