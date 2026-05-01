@@ -1,0 +1,13 @@
+Okay so i have project called distributed autonomous robotic system whose main job is to track objects, but the main this is that it will be executed on edge devices, and not only one but it will be connected to many edge devices,
+since we dont have any edge devices with us due to cost factors, we are simulating the whole thing in a webot environment where we are using an epuck robot, and with that robot and a camera and an moving object placed in front of it
+the bot tries to track the moving object, the bot is using a clip model with the configuration in the files. The main thing here is that or our main focus was to distribute the computation of our work on conencted devices, for example i 
+have a laptop and another laptop connected to a network now i will use that laptop as a secondry device and try to use its computation resources to calculate the clip models forward pass and then use these results.
+
+there are other details like splitting criteria and stuff which you can see in the project directory and stuff but but rn my project is only limited to the device which are connected to the computer, at the start of the program,
+WHAT I WANT you to do is change the project slightly in a way that at anytime if a device tries to connect to the main simulation running device it should conenct to it and offload the work accordingly, this concept is called loosely coupled technique.
+Try to make the program fully optimized and efficient also make sure that the division is possible and make sure to reduce network overhead and optimize every possible step where, as far as the Benchmarks are concerend there is a seperate file for that 
+which i will tell you to change later on.
+
+now i want you to implement this, read the 23i0119_research_proposal_PDC.pdf file for any other issues or help.
+
+Also you might come accross some techniques which are not implemented, but were mentioned in the paper like using YOLO and stuff, you can completely skip that and just focus on the approach mentioned and it should be very good at this.

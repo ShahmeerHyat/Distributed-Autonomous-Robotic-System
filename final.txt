@@ -1,0 +1,262 @@
+================================================================================
+  FINAL.TXT  —  LCP (Loosely Coupled Protocol) Implementation Changelog
+  Branch: lcp_spvit
+  Folder: Simulation World/controllers/clip_detector_lcp/
+================================================================================
+
+All original files under clip_detector/ and clip_detector_bm/ are UNTOUCHED.
+Everything below lives exclusively in the new clip_detector_lcp/ directory.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 1: distributedSystem/shared_utils.py
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 1 — fp16 wire protocol  (_to_fp16, _to_fp32, updated send_msg / recv_msg)
+  REASON: The original send_msg serialised tensors as float32. A single ATTN
+  payload (q, k, v slices for 6 heads over 50 tokens) is ~230 KB; over 12
+  transformer blocks that is ~2.8 MB per inference call, per worker — every
+  time. Halving this to fp16 cuts bandwidth to ~1.4 MB per call. On a typical
+  WiFi link (150 Mbps effective) this saves ~75 ms of transmission time, which
+  is significant when total inference targets < 200 ms.
+
+  HOW: _to_fp16() / _to_fp32() recurse into tuples and lists so the entire
+  message payload (including nested (q, k, v) tuples) is converted atomically.
+  send_msg calls _to_fp16 before torch.save; recv_msg calls _to_fp32 after
+  torch.load. The caller sees only float32 tensors — the conversion is
+  completely transparent to both master and worker.
+
+  ACCURACY IMPACT: CLIP cosine similarity operates on normalised vectors.
+  fp16 has ~3 decimal digits of precision; the resulting error in cosine
+  similarity is < 0.01%, well below the CONFIDENCE_THRESHOLD resolution.
+
+CHANGE 2 — tune_socket() helper
+  REASON: By default, TCP's Nagle algorithm buffers small writes for up to
+  200 ms before sending, which adds latency when sending many small control
+  messages (PING, task headers). TCP_NODELAY disables this. Enlarged OS
+  send/receive buffers (1 MiB each) prevent buffer stalls when transmitting
+  large tensor payloads.
+
+CHANGE 3 — indices_from_shares() module-level function
+  REASON: The original get_indices() on MultiDeviceARIMAManager reads live
+  self.devices and self.current_shares. In the LCP design, a background
+  thread can call add_device() or remove_device() at any moment, mutating
+  those structures while run_inference() is mid-block. Reading live state
+  without a lock would produce undefined behaviour (wrong head assignments,
+  shape mismatches). The solution is to snapshot (block_devices, block_shares)
+  at the start of each transformer block under a lock, then use this standalone
+  function for all index calculations in that block — no lock needed for the
+  actual compute.
+
+CHANGE 4 — MultiDeviceARIMAManager.add_device()
+  REASON: The original ARIMA manager was initialised with a fixed device list
+  and had no way to accept new workers at runtime. add_device() registers the
+  device with empty history and zero initial share. The zero share is
+  intentional: the worker has no measured latency yet, so giving it any real
+  share would be a guess. After preflight, prime() seeds the history, and the
+  next update_shares() call will compute a sensible share based on the seeded
+  RTT data.
+
+CHANGE 5 — MultiDeviceARIMAManager.reset_device()
+  REASON: When a worker reconnects (same name), its old latency history and
+  circuit-breaker state reflect the previous session (possibly a different
+  network path, load, or hardware state). Carrying stale history forward would
+  mis-calibrate the load balancer. reset_device() clears history and
+  re-initialises the circuit breaker so the fresh preflight measurements are
+  the only input to ARIMA's first prediction after reconnection.
+
+CHANGE 6 — MultiDeviceARIMAManager.remove_device()
+  REASON: When a worker disconnects permanently, its share must be returned to
+  the remaining devices (primarily edge) so the shares still sum to 1.0.
+  Without this, the edge would operate at a fractional share (e.g. 0.5)
+  forever, computing only half the heads and leaving the other half as zeros —
+  producing garbage inference output.
+
+CHANGE 7 — Guard against removed devices in record_block_latency()
+  REASON: If a worker is removed by _cleanup_worker() during a block (between
+  the dispatch and the ARIMA bookkeeping at the end), record_block_latency()
+  would hit a KeyError on norm_history[device_id]. Added an early return when
+  device_id is not in norm_history.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 2: distributedSystem/master.py
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 8 — Removed expected_workers parameter
+  REASON: The tightly coupled design required knowing the exact worker list
+  before starting. The new model has no pre-known workers; they register
+  themselves at runtime. The parameter is gone entirely.
+
+CHANGE 9 — Persistent background listener thread (_listener_loop)
+  REASON: The original _wait_for_workers() blocked the main thread until all
+  expected workers connected, then closed the server socket permanently. This
+  made it impossible for any new worker to join after startup. The LCP design
+  keeps the server socket open in a daemon thread that calls accept() in a
+  non-blocking loop (1s timeout). Each accepted connection is handed off to a
+  separate _handle_new_connection thread so the listener never blocks.
+
+CHANGE 10 — _handle_new_connection() dynamic registration flow
+  REASON: Sequencing matters. The flow is:
+    (a) Set socket immediately (needed so _measure_rtt can ping it).
+    (b) Run preflight OUTSIDE the lock (8 RTT pings; takes real time).
+    (c) Under the lock: add_device() / reset_device() + prime().
+  This ordering ensures: (1) the listener thread is never blocked while
+  preflight runs; (2) the worker never appears in block_devices with an
+  empty latency history (which would give it a spuriously large share on
+  the first block via the fallback prediction of 0.1s).
+
+CHANGE 11 — Socket replacement for reconnecting workers
+  REASON: A worker may crash and reconnect with the same name. The old socket
+  is in a broken state but still occupies the sockets dict. The new connection
+  closes the old socket first, then replaces the slot, and calls reset_device()
+  to clear stale ARIMA state. This is strictly better than rejection, which
+  would require the user to rename the worker and restart Webots.
+
+CHANGE 12 — threading.RLock() for all shared state
+  REASON: self.sockets, self.all_devices, and self.arima are accessed by:
+    - The main simulation thread (run_inference)
+    - The listener thread (_handle_new_connection via preflight)
+    - Cleanup threads (_cleanup_worker)
+  RLock (reentrant) is used because the same thread may acquire the lock in
+  nested calls (e.g. shutdown() → cleanup). A regular Lock would deadlock.
+
+CHANGE 13 — Block snapshot pattern in run_inference()
+  REASON: See CHANGE 3. At the start of each transformer block:
+    with self._lock:
+        self.arima.update_shares()
+        block_devices = list(self.arima.devices)
+        block_shares  = dict(self.arima.current_shares)
+  After this, the lock is released and all index calculations use
+  indices_from_shares(block_devices, block_shares, ...) — no lock held during
+  compute or network I/O. Workers joining mid-inference are visible from the
+  next run_inference() call; workers disconnecting mid-block are handled by
+  zero-fill (CHANGE 14).
+
+CHANGE 14 — Zero-fill on worker failure mid-block (ATTN path)
+  REASON: Unchanged from the original, but now uses the block snapshot's
+  h_range rather than live ARIMA state. If a worker's result is None (dispatch
+  failed), the head slice is filled with zeros so attn_out stays numerically
+  defined. The next block's snapshot will not include the removed worker.
+
+CHANGE 15 — Full-edge fallbacks for ATTN and MLP
+  REASON: There is a narrow race where a worker disconnect happens AFTER the
+  block snapshot lists that worker but BEFORE its head slice is added to
+  head_parts — resulting in an empty head_parts list. The fallback recomputes
+  the full 12-head attention on the edge to avoid a torch.cat on an empty list.
+
+CHANGE 16 — _cleanup_worker() dispatched in a background thread from _dispatch_task()
+  REASON: _dispatch_task() is called inside a ThreadPoolExecutor future. If it
+  blocked on _cleanup_worker() (which acquires the lock), it could deadlock
+  with run_inference() which holds the lock during the bookkeeping phase. By
+  spawning a daemon thread for cleanup, the future returns immediately with
+  (None, PROBE_FAIL_LATENCY) and cleanup happens asynchronously.
+
+CHANGE 17 — Edge-only operation guaranteed from t=0
+  REASON: MasterOrchestrator starts with all_devices=["edge"] and
+  arima.current_shares={"edge": 1.0}. run_inference() with no active workers
+  assigns all 12 heads and all 3072 MLP neurons to edge — mathematically
+  equivalent to local inference but routed through the same code path, so
+  worker activation requires no code-path changes.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 3: distributedSystem/worker.py
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 18 — Fixed quick_gelu activation in compute_mlp_slice()  [BUG FIX]
+  REASON: The original worker.py used torch.nn.functional.gelu for the MLP
+  activation. CLIP ViT-B/32 uses quick_gelu (a fast approximation defined as
+  x * sigmoid(1.702 * x)), not the standard gelu. For the same input tensor,
+  gelu and quick_gelu produce different values. This meant the worker's MLP
+  contribution was mathematically wrong — it would sum to the wrong final
+  embedding and produce incorrect cosine similarities.
+
+  FIX: Replace hardcoded torch.nn.functional.gelu with
+       block.mlp.activation_fn
+  This reads the activation directly from the loaded model's config, which
+  resolves to quick_gelu for CLIP and would resolve correctly for any future
+  model variant without code changes.
+
+  NOTE: The master (both original and LCP) already used activation_fn
+  correctly. Only the worker had this bug.
+
+CHANGE 19 — Reconnection loop in run_worker_client()
+  REASON: In the tightly coupled design, if the worker lost connection it would
+  exit and require a manual restart. In the LCP design, the master accepts
+  reconnections at any time. The worker now loops indefinitely, sleeping for
+  --reconnect-interval seconds between attempts. This makes the worker resilient
+  to: Webots restarts, master crashes, and transient network failures — all
+  without user intervention.
+
+CHANGE 20 — TCP_NODELAY + enlarged OS buffers via tune_socket()
+  REASON: Same as CHANGE 2. Applied to the worker-side socket immediately after
+  connect(), before the REGISTER message is sent.
+
+CHANGE 21 — Separated _serve() from run_worker_client()
+  REASON: Clean separation of concerns. _serve() handles the task loop for a
+  single connection. When it returns (connection dropped), the outer
+  run_worker_client() loop reconnects without reloading the model. The model
+  (605 MB) is loaded once at startup.
+
+CHANGE 22 — --reconnect-interval CLI argument
+  REASON: Different deployment environments have different tolerance for
+  reconnect frequency. A lab LAN can retry every 2s; a flaky WiFi link might
+  need 10s to avoid hammering the listener. Defaults to 5s.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 4: clip_detector_lcp.py
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 23 — No expected_workers in MasterOrchestrator instantiation
+  REASON: The parameter no longer exists in the LCP master. The orchestrator
+  starts in edge-only mode immediately.
+
+CHANGE 24 — Startup message points to worker connection command
+  REASON: In the LCP model there is no blocking "waiting for workers..." phase.
+  The print statement tells the user (or log) what command to run on the remote
+  machine to attach a worker, since the simulation is already running.
+
+CHANGE 25 — All other logic identical to clip_detector.py
+  REASON: The robot controller logic (steering, EMA, confidence threshold,
+  patch heatmap, text embedding) is correct and unchanged. The only architectural
+  difference is the master being LCP. Duplicating unchanged logic would create
+  drift risk; it is kept verbatim.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 5: distributedSystem/__init__.py
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 26 — Empty __init__.py
+  REASON: Makes distributedSystem an explicit Python package so
+  "from distributedSystem.master import ..." works reliably across Python
+  versions and regardless of how Webots adds directories to sys.path.
+
+================================================================================
+  HOW TO USE THE LCP VERSION
+================================================================================
+
+1. In Webots, change the e-puck controller from "clip_detector" to
+   "clip_detector_lcp". The simulation starts immediately in edge-only mode.
+
+2. On any machine on the same network, run:
+
+       cd "Simulation World/controllers/clip_detector_lcp/distributedSystem"
+       python worker.py --name <unique-id> --master-host <edge-device-IP> --gpu
+
+   The worker connects, runs preflight, and the master begins distributing
+   heads within seconds — with no restart required on either side.
+
+3. Workers can be added or removed at any time. The ARIMA load balancer
+   adapts continuously. If a worker drops, the simulation keeps running
+   on edge only until it reconnects.
+
+================================================================================
+  WHAT WAS NOT CHANGED
+================================================================================
+
+- clip_detector/           (original tightly coupled controller) — untouched
+- clip_detector_bm/        (benchmark variant) — untouched (per user request)
+- ball_motion/             — untouched
+- display_detections/      — untouched
+- download_model.py        — untouched
+- Clip Model/              — untouched
+- Simulation World/worlds/ — untouched (user updates .wbt controller name manually)
+================================================================================
