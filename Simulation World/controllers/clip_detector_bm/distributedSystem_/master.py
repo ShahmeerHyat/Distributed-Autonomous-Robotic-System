@@ -23,11 +23,11 @@ from transformers import CLIPModel
 # Relative imports when used as a package; bare imports when run standalone.
 try:
     from .splitInfer import MultiDeviceEvaluator
-    from .comms import send_msg, recv_msg, probe_rtt, ping_worker, CircuitBreaker
+    from .comms import send_msg, recv_msg, probe_rtt, CircuitBreaker
     from .helper import get_model_metadata, to_head_space, sum_mlp_parts, allocate_heads
 except ImportError:
     from splitInfer import MultiDeviceEvaluator
-    from comms import send_msg, recv_msg, probe_rtt, ping_worker, CircuitBreaker
+    from comms import send_msg, recv_msg, probe_rtt, CircuitBreaker
     from helper import get_model_metadata, to_head_space, sum_mlp_parts, allocate_heads
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,8 +61,9 @@ class MasterOrchestrator:
 
         self.meta = meta or get_model_metadata(self.model)
 
-        self.sockets: dict      = {}
-        self.worker_addrs: dict = {}
+        self.sockets: dict        = {}                                                                                                                                                          
+        self.worker_addrs: dict   = {}                                                                                                                                                          
+        self._preflight_rtt: dict = {}   # median RTT per worker, set in _preflight   
         self._wait_for_workers(host, port)
         self.executor = ThreadPoolExecutor(max_workers=max(1, len(expected_workers)))
         self._preflight()
@@ -107,7 +108,7 @@ class MasterOrchestrator:
 
             median_rtt = sorted(rtts)[len(rtts) // 2]
             print(f"  {w_name}: RTTs={[f'{r:.3f}s' for r in rtts]} → median {median_rtt:.3f}s")
-
+            self._preflight_rtt[w_name] = median_rtt
             for rtt in rtts:
                 if rtt < PROBE_FAIL_LATENCY:
                     self.evaluator.record_step(w_name, latency=rtt, compute_time=0.0)
@@ -179,20 +180,16 @@ class MasterOrchestrator:
         end_idx=None,
     ) -> tuple:
         """
-        Returns (result_tensor, network_time, compute_time).
-        Pings first to isolate RTT, then dispatches the workload.
-        Separating RTT from compute gives the AIMD evaluator cleaner signals.
+        RTT is estimated from the preflight median rather than measured inline.                                                                                                                
+        Paying an extra round-trip per dispatch on every block of a 12-block                                                                                                                   
+        sequential encoder adds ~24 pings/frame (~120 ms on a 5 ms LAN) for no                                                                                                                 
+        runtime benefit — the evaluator gets a clean signal from preflight RTT                                                                                                                 
+        plus the per-block update after results arrive. 
         """
         try:
             sock = self.sockets[worker_name]
-
-            # Pure RTT ping before any compute payload.
-            rtt = ping_worker(sock)
-            if rtt is None:
-                return None, PROBE_FAIL_LATENCY, 0.0
-
-            t0 = time.perf_counter()
-
+            t0   = time.perf_counter()
+            
             if task_type == "ATTN":
                 assert isinstance(payload, tuple) and len(payload) == 3
                 send_msg(sock, ("ATTN", block_idx, payload))
@@ -205,12 +202,12 @@ class MasterOrchestrator:
 
             res          = recv_msg(sock)
             total_time   = time.perf_counter() - t0
-            compute_time = max(0.0, total_time - rtt)
 
             if res is None:
                 raise ConnectionError(f"Worker '{worker_name}' disconnected.")
-
-            return res, rtt, compute_time
+            net_t  = self._preflight_rtt.get(worker_name, total_time * 0.3)                                                                                                                    
+            comp_t = max(0.0, total_time - net_t)                                                                                                                                              
+            return res, net_t, comp_t   
 
         except Exception as exc:
             print(f"\n  [ERROR] Dispatch to '{worker_name}' failed: {exc}")
