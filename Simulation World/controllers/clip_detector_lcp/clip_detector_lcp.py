@@ -10,13 +10,12 @@ Loosely Coupled Protocol version:
     measurement and begins distributing heads/neurons on the next inference call.
 """
 
-from controller import Supervisor
+from controller import Supervisor          
 import numpy as np
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from distributedSystem.master import MasterOrchestrator
-from concurrent.futures import ThreadPoolExecutor
 import os
 # ─────────────────────────────────────────────────────────────────────────────
 # Robot init
@@ -193,81 +192,72 @@ with torch.no_grad():
 # Persistent state
 # ─────────────────────────────────────────────────────────────────────────────
 
-last_logits    = 0.0
-last_error     = 0.0
-step_count     = 0
-_pending_future = None
-_infer_pool    = ThreadPoolExecutor(max_workers=1)
+last_logits = 0.0
+last_error  = 0.0
+step_count  = 0
 
 print(f"[RUN] Searching for: '{SEARCH_PROMPT}'")
 print("[RUN] Connect workers at any time: "
       "python worker.py --name <id> --master-host <this IP>")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Background inference  — runs in a thread so robot.step() never blocks
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _clip_inference(image):
-    """Returns (logits, raw_error). Called from the inference thread pool."""
-    with torch.no_grad():
-        img_inputs   = processor(images=image, return_tensors="pt")
-        pixel_values = img_inputs["pixel_values"]
-
-        hidden      = model.vision_model.embeddings(pixel_values)
-        hidden      = model.vision_model.pre_layrnorm(hidden)
-        last_hidden = orch.run_inference(hidden)
-
-        cls_token    = last_hidden[:, 0, :]
-        pooled       = model.vision_model.post_layernorm(cls_token)
-        image_embeds = model.visual_projection(pooled)
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-
-        patches           = last_hidden[:, 1:, :]
-        patches           = model.vision_model.post_layernorm(patches)
-        projected_patches = model.visual_projection(patches)
-        projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
-
-        heatmap  = torch.matmul(projected_patches[0], text_emb.t()).squeeze()
-        scale    = model.logit_scale.exp()
-        logits   = (image_embeds @ text_emb.t()).item() * scale.item()
-        weights  = torch.softmax(heatmap / 0.1, dim=0)
-        center_x = (weights * _xs).sum().item()
-        raw_error = (center_x - 3) / 3
-        return logits, raw_error
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 while robot.step(timestep) != -1:
-    step_count += 1
-
+    step_count   += 1
+    run_inference = (step_count % INFERENCE_EVERY_N == 0)
     # ── Reset trigger ────────────────────────────────────────────────────
     if step_count % RESET_EVERY_N_FRAMES == 0:
         print(f"[RESET] Frame {step_count} — resetting world")
         reset_world()
-        _pending_future = None   # stale result after reset is irrelevant
+
+        # Clear stale inference state so the robot doesn't carry over
+        # a confidence score or steering error from the previous episode
         last_logits = 0.0
         last_error  = 0.0
         continue
-
-    # ── Collect completed inference result ───────────────────────────────
-    if _pending_future is not None and _pending_future.done():
-        try:
-            logits, raw_error = _pending_future.result()
-            last_logits = logits
-            last_error  = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
-        except Exception as e:
-            print(f"[WARN] Inference error: {e}")
-        _pending_future = None
-
-    # ── Submit new inference if none is running ───────────────────────────
-    if step_count % INFERENCE_EVERY_N == 0 and _pending_future is None:
+    if run_inference:
         image = get_frame_as_pil(camera)
+
         if image is not None:
-            _pending_future = _infer_pool.submit(_clip_inference, image)
+            with torch.no_grad():
+                img_inputs   = processor(images=image, return_tensors="pt")
+                pixel_values = img_inputs["pixel_values"]
+
+                # 1. Patch embedding + pre-norm (local, cheap)
+                hidden = model.vision_model.embeddings(pixel_values)
+                hidden = model.vision_model.pre_layrnorm(hidden)
+
+                # 2. Distributed encoder (edge + any connected workers)
+                last_hidden = orch.run_inference(hidden)
+
+                # 3. Pooling & post-norm for global confidence score
+                cls_token    = last_hidden[:, 0, :]
+                pooled       = model.vision_model.post_layernorm(cls_token)
+                image_embeds = model.visual_projection(pooled)
+                image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+
+                # 4. Patch features for spatial heatmap
+                patches           = last_hidden[:, 1:, :]
+                patches           = model.vision_model.post_layernorm(patches)
+                projected_patches = model.visual_projection(patches)
+                projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
+
+                # 5. Similarity scores
+                heatmap = torch.matmul(projected_patches[0], text_emb.t()).squeeze()
+                scale   = model.logit_scale.exp()
+
+                last_logits = (image_embeds @ text_emb.t()).item() * scale.item()
+
+                weights  = torch.softmax(heatmap / 0.1, dim=0)
+                center_x = (weights * _xs).sum().item()
+
+                raw_error  = (center_x - 3) / 3
+                last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
 
     # ── Motor control ─────────────────────────────────────────────────────
+
     if last_logits > CONFIDENCE_THRESHOLD:
         left_speed, right_speed, state_label = compute_speeds(last_error)
     else:
