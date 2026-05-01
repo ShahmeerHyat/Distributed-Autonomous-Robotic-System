@@ -208,12 +208,17 @@ class CircuitBreaker:
 
 class MultiDeviceARIMAManager:
 
-    DROP_MULT    = 3.0
-    ADMIT_MULT   = 1.8
+    # WiFi workers include ~6ms RTT + ~15ms data transfer per block in their
+    # measured latency, making them appear 8-10× slower than edge in normalized
+    # terms even when healthy.  DROP_MULT=15 means a worker must be 15× slower
+    # before being excluded; ADMIT_MULT=5 sets the hysteresis recovery bar.
+    DROP_MULT    = 15.0
+    ADMIT_MULT   = 5.0
     PROBE_SHARE  = 0.10
     EMA_ALPHA    = 0.35
     MAX_HISTORY  = 24
-    MIN_WORKER_SHARE = 0.10
+    MIN_WORKER_SHARE = 0.20  # floor raised: always keep workers at ≥20% so
+                              # history keeps updating and WiFi workers stay active
 
     def __init__(
         self,
@@ -292,10 +297,26 @@ class MultiDeviceARIMAManager:
     # ── Pre-flight ─────────────────────────────────────────────────────────
 
     def prime(self, device_id: str, rtt_samples: list, nominal_share: float = 0.5):
-        """Seed a device's normalized latency history from preflight RTTs."""
+        """
+        Seed a device's normalized latency history from preflight RTTs.
+        Uses the full RTT (not RTT/2) so the estimate includes the round-trip
+        network overhead that will appear in every real dispatch as well.
+        """
         for rtt in rtt_samples:
-            compute_estimate = rtt / 2.0
-            norm = compute_estimate / nominal_share
+            norm = rtt / nominal_share   # full RTT / share → realistic baseline
+            self.norm_history[device_id].append(norm)
+            if len(self.norm_history[device_id]) > self.MAX_HISTORY:
+                self.norm_history[device_id].pop(0)
+
+    def prime_task(self, device_id: str, task_latency: float, nominal_share: float = 0.5):
+        """
+        Seed history from an actual ATTN task dispatch (measured in master's
+        _preflight_worker).  More accurate than RTT alone because it includes
+        the data-transfer overhead for real tensor payloads.
+        Called after prime() so task measurements overwrite the RTT-only seeds.
+        """
+        norm = task_latency / nominal_share
+        for _ in range(self.p + self.d + 1):   # enough samples for _predict to use ARIMA path
             self.norm_history[device_id].append(norm)
             if len(self.norm_history[device_id]) > self.MAX_HISTORY:
                 self.norm_history[device_id].pop(0)
@@ -378,11 +399,13 @@ class MultiDeviceARIMAManager:
                 continue
             elif cb.is_half_open:
                 probe_devs.append(dev)
-            elif pred > edge_pred * self.DROP_MULT:
-                cb.trip(reason=f"norm_pred {pred:.2f}s > {self.DROP_MULT}× edge {edge_pred:.2f}s")
-            elif pred > edge_pred * self.ADMIT_MULT:
-                active_devs[dev] = 1.0 / pred
             else:
+                # CB is CLOSED: always include the worker.
+                # ARIMA gives it a score inversely proportional to predicted
+                # latency — slower workers get fewer heads automatically.
+                # We never trip the CB here; the circuit breaker fires ONLY
+                # on actual dispatch failures (exceptions / disconnects) so
+                # that WiFi overhead does not incorrectly exclude healthy workers.
                 active_devs[dev] = 1.0 / pred
 
         probe_reserved = len(probe_devs) * self.PROBE_SHARE
@@ -395,10 +418,13 @@ class MultiDeviceARIMAManager:
         for dev in probe_devs:
             target[dev] = self.PROBE_SHARE
 
+        # Floor: every CLOSED worker always gets at least MIN_WORKER_SHARE.
+        # This covers both the case where ARIMA assigns a tiny score (worker
+        # slow but healthy) and the case where target == 0 (safety net).
         for dev in self.devices:
             if dev == "edge" or dev not in self.breakers:
                 continue
-            if self.breakers[dev].is_closed and 0 < target[dev] < self.MIN_WORKER_SHARE:
+            if self.breakers[dev].is_closed and target[dev] < self.MIN_WORKER_SHARE:
                 deficit = self.MIN_WORKER_SHARE - target[dev]
                 target[dev]    = self.MIN_WORKER_SHARE
                 target["edge"] = max(0.0, target.get("edge", 0.0) - deficit)

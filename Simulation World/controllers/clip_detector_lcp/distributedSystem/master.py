@@ -161,8 +161,19 @@ class MasterOrchestrator:
                 return
 
             med_rtt = sorted(samples)[len(samples) // 2]
-            print(f"  {name}: median RTT = {med_rtt:.3f}s  "
-                  f"[{', '.join(f'{r:.3f}' for r in samples)}]")
+            print(f"  {name}: median RTT = {med_rtt*1000:.1f}ms  "
+                  f"[{', '.join(f'{r*1000:.1f}' for r in samples)}]ms")
+
+            # Measure actual ATTN dispatch latency (includes WiFi data transfer).
+            # This is much more accurate than RTT alone for seeding ARIMA because
+            # real dispatches send ~300 KB of tensor data per block.
+            task_lat = self._measure_task_latency(name)
+            if task_lat < PROBE_FAIL_LATENCY:
+                print(f"  {name}: ATTN task latency (50% heads) = {task_lat*1000:.1f}ms  "
+                      f"(vs RTT {med_rtt*1000:.1f}ms — "
+                      f"data overhead = {(task_lat-med_rtt)*1000:.1f}ms)")
+            else:
+                print(f"  {name}: task latency measurement failed — using RTT only")
 
             # ── Add to ARIMA (under lock) ─────────────────────────────────
             with self._lock:
@@ -172,13 +183,17 @@ class MasterOrchestrator:
                     self.arima.add_device(name)
                     self.all_devices.append(name)
 
-                # Seed latency history with preflight measurements.
+                # Seed with RTT first, then overwrite with actual task latency
+                # so ARIMA starts with a realistic picture of dispatch cost.
                 self.arima.prime(name, samples, nominal_share=0.5)
+                if task_lat < PROBE_FAIL_LATENCY:
+                    self.arima.prime_task(name, task_lat, nominal_share=0.5)
 
-                # Pre-trip the circuit breaker if the worker is already slow.
+                # Pre-trip only if truly catastrophic (>DROP_MULT × assumed edge).
+                # With DROP_MULT=15 this threshold is intentionally very high.
                 edge_guess = 0.05
                 if med_rtt / 0.5 > edge_guess * MultiDeviceARIMAManager.DROP_MULT:
-                    print(f"  [Preflight] '{name}' is slow → pre-tripping CB")
+                    print(f"  [Preflight] '{name}' is extremely slow → pre-tripping CB")
                     self.arima.breakers[name].trip(reason="pre-flight RTT too high")
 
             print(f"[Master] Worker '{name}' is active.")
@@ -190,7 +205,7 @@ class MasterOrchestrator:
             except Exception:
                 pass
 
-    # ── RTT measurement ──────────────────────────────────────────────────────
+    # ── Preflight measurements ───────────────────────────────────────────────
 
     def _measure_rtt(self, name: str) -> list:
         with self._lock:
@@ -210,6 +225,43 @@ class MasterOrchestrator:
             except Exception:
                 samples.append(PROBE_FAIL_LATENCY)
         return samples
+
+    def _measure_task_latency(self, name: str, n_samples: int = 4) -> float:
+        """
+        Dispatch real-sized ATTN tensors (fp16, 50% head share) to get the true
+        round-trip latency including WiFi data-transfer overhead.  A PING only
+        measures propagation delay; actual dispatches are dominated by the
+        transfer of ~300 KB of tensor data per block per worker.
+
+        Returns median latency in seconds, or PROBE_FAIL_LATENCY on failure.
+        """
+        with self._lock:
+            sock = self.sockets.get(name)
+        if sock is None or not self.meta:
+            return PROBE_FAIL_LATENCY
+
+        H  = self.meta["num_heads"]
+        hd = self.meta["head_dim"]
+        S  = self.meta["seq_length"]
+        half_H = max(1, H // 2)
+
+        dummy_q = torch.zeros(1, half_H, S, hd)
+        dummy_k = torch.zeros(1, half_H, S, hd)
+        dummy_v = torch.zeros(1, half_H, S, hd)
+
+        samples = []
+        for _ in range(n_samples):
+            try:
+                t0 = time.time()
+                send_msg(sock, ("ATTN", 0, (dummy_q, dummy_k, dummy_v)))
+                resp = recv_msg(sock)
+                lat  = time.time() - t0
+                samples.append(lat if resp is not None else PROBE_FAIL_LATENCY)
+            except Exception:
+                samples.append(PROBE_FAIL_LATENCY)
+
+        valid = [s for s in samples if s < PROBE_FAIL_LATENCY]
+        return sorted(valid)[len(valid) // 2] if valid else PROBE_FAIL_LATENCY
 
     # ── Worker cleanup ───────────────────────────────────────────────────────
 
@@ -260,6 +312,13 @@ class MasterOrchestrator:
 
         except Exception as exc:
             print(f"\n  [ERROR] Dispatch to '{worker_name}' failed: {exc}")
+            # Trip the circuit breaker on actual connection failure.
+            # This is the ONLY place the CB fires — not from slow latency.
+            with self._lock:
+                if worker_name in self.arima.breakers:
+                    self.arima.breakers[worker_name].trip(
+                        reason=f"dispatch exception: {type(exc).__name__}"
+                    )
             # Cleanup in a background thread — don't block the inference future.
             threading.Thread(
                 target=self._cleanup_worker, args=(worker_name,), daemon=True
