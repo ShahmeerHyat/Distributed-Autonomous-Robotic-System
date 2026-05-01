@@ -1,0 +1,34 @@
+Distributed Benchmarks:
+[Master] Edge-only mode. Listening for workers on 0.0.0.0:29500
+[RUN] Searching for: 'a round ball with black and white patches'
+[RUN] Connect workers at any time: python worker.py --name <id> --master-host <this IP>
+[Master] New worker 'worker1' from 192.168.0.4. Running preflight...
+  worker1: median RTT = 3.6ms  [3.6, 3.0, 2.9, 2.9, 3.8, 8.1, 4.3, 3.5]ms
+  worker1: ATTN task latency (50% heads) = 18.3ms  (vs RTT 3.6ms — data overhead = 14.7ms)
+[Master] Worker 'worker1' is active.
+────────────────────────────────────────────────────────────────────────
+  [Master] Inference #20  —  2 device(s) active
+  Device         Share          Heads             MLP neurons    Latency
+  ──────        ──────  ─────────────  ──────────────────────  ─────────
+  edge          80.0%    0-9 (10/12)      0-2457 (2458/3072)  6.6ms/blk
+  worker1       20.0%   10-11 (2/12)    2458-3071 (614/3072)  27.2ms/blk
+────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+  [Master] Inference #40  —  2 device(s) active
+  Device         Share          Heads             MLP neurons    Latency
+  ──────        ──────  ─────────────  ──────────────────────  ─────────
+  edge          80.0%    0-9 (10/12)      0-2457 (2458/3072)  6.5ms/blk
+  worker1       20.0%   10-11 (2/12)    2458-3071 (614/3072)  25.4ms/blk
+────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+  [Master] Inference #60  —  2 device(s) active
+  Device         Share          Heads             MLP neurons    Latency
+  ──────        ──────  ─────────────  ──────────────────────  ─────────
+  edge          80.0%    0-9 (10/12)      0-2457 (2458/3072)  6.7ms/blk
+  worker1       20.0%   10-11 (2/12)    2458-3071 (614/3072)  26.0ms/blk
+────────────────────────────────────────────────────────────────────────
+
+
+Computer Specs:
+Edge device: Core i-7 4th 2.15Ghz Generation 16 GB RAM
+Worker device: Corei5-8th 3 Ghz Generation 8GB RAM 

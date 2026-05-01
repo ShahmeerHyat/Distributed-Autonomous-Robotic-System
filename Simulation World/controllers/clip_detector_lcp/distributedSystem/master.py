@@ -39,7 +39,7 @@ from distributedSystem.shared_utils import (
 # ─────────────────────────────────────────────────────────────────────────────
 PREFLIGHT_PINGS    = 8
 PROBE_FAIL_LATENCY = 999.0
-DEBUG_PRINT_EVERY  = 10   # print allocation table every N inference calls
+DEBUG_PRINT_EVERY  = 20   # print allocation table every N inference calls
 
 
 def _print_split_table(inference_num, block_devices, block_shares, num_heads,
