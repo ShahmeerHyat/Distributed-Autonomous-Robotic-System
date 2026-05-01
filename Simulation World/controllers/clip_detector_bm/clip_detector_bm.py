@@ -19,8 +19,8 @@ import time
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
-from distributedSystem.master import MasterOrchestrator
-from distributedSystem.benchmarks import BenchmarkCollector
+from distributedSystem_.master import MasterOrchestrator
+from distributedSystem_.benchmarks import BenchmarkCollector
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Robot init
