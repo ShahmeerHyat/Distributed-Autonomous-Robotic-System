@@ -40,6 +40,7 @@ from distributedSystem.shared_utils import (
 PREFLIGHT_PINGS    = 8
 PROBE_FAIL_LATENCY = 999.0
 DEBUG_PRINT_EVERY  = 10   # print allocation table every N inference calls
+MAX_CONSECUTIVE_TRIPS = 6  # auto-remove a worker after this many CB trips
 
 
 def _print_split_table(inference_num, block_devices, block_shares, num_heads,
@@ -508,6 +509,20 @@ class MasterOrchestrator:
                         self.arima.notify_probe_result(w, lat / s)
                     else:
                         self.arima.notify_probe_result(w, PROBE_FAIL_LATENCY)
+
+                # Auto-remove workers stuck in CB oscillation (repeated probe
+                # failures indicate a broken/incompatible connection that will
+                # never recover on its own).
+                zombies = [
+                    w for w in list(block_devices)
+                    if w != "edge"
+                    and w in self.arima.breakers
+                    and self.arima.breakers[w].consecutive_trips >= MAX_CONSECUTIVE_TRIPS
+                ]
+            for w in zombies:
+                print(f"[Master] Worker '{w}' failed {MAX_CONSECUTIVE_TRIPS} consecutive "
+                      f"probes — removing. Reconnect to re-register.")
+                threading.Thread(target=self._cleanup_worker, args=(w,), daemon=True).start()
 
             # ── Accumulate latency for the debug summary ──────────────────
             if should_print:

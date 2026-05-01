@@ -247,8 +247,10 @@ class MultiDeviceARIMAManager:
 
     def add_device(self, device_id: str):
         """
-        Register a brand-new worker. Initialises its state with zero share;
-        update_shares() will compute a real share once prime() seeds the history.
+        Register a brand-new worker. Immediately grants it MIN_WORKER_SHARE,
+        scaling existing shares down proportionally so the total stays at 1.0.
+        Starting from 0 caused a slow EMA ramp that left workers at 0% for many
+        early inferences even when they had capacity.
         """
         if device_id in self.devices:
             return  # Already present — caller should use reset_device instead
@@ -256,9 +258,21 @@ class MultiDeviceARIMAManager:
         self.norm_history[device_id]   = []
         self.residuals[device_id]      = []
         self.last_preds[device_id]     = 0.0
-        self.current_shares[device_id] = 0.0
         if device_id != "edge":
             self.breakers[device_id] = CircuitBreaker()
+
+        # Carve MIN_WORKER_SHARE out of existing allocations proportionally.
+        new_share   = self.MIN_WORKER_SHARE
+        total_exist = sum(self.current_shares.values()) or 1.0
+        scale       = max(0.0, total_exist - new_share) / total_exist
+        for d in list(self.current_shares):
+            self.current_shares[d] *= scale
+        self.current_shares[device_id] = new_share
+        # Re-normalise to keep sum == 1.0.
+        total = sum(self.current_shares.values())
+        if total > 0:
+            for d in self.devices:
+                self.current_shares[d] /= total
 
     def reset_device(self, device_id: str):
         """
