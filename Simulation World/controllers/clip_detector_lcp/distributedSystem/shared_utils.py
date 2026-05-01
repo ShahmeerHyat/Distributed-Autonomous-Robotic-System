@@ -128,12 +128,17 @@ def to_head_space(x: torch.Tensor, h_range: range, num_heads: int, head_dim: int
 def indices_from_shares(device_order: list, shares: dict, dev: str, total: int) -> range:
     """
     Compute a device's contiguous index range from a pre-snapshotted shares dict.
-    Uses device_order to ensure consistent assignment across master and workers.
+
+    Uses cumulative rounding: each boundary is round(cumulative_share * total).
+    This guarantees all counts sum exactly to `total` regardless of floating-point
+    precision — individual per-device rounding can lose units (e.g. round(5.4999)
+    + round(6.4999) = 5 + 6 = 11 instead of 12).
     """
+    cumulative = 0.0
     start = 0
     for d in device_order:
-        count = int(round(shares.get(d, 0.0) * total))
-        end   = start + count
+        cumulative += shares.get(d, 0.0)
+        end = round(cumulative * total)
         if d == dev:
             return range(start, min(end, total))
         start = end

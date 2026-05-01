@@ -1,5 +1,6 @@
 from controller import Supervisor   #type: ignore
 import math
+import os
 
 # Use Supervisor instead of Robot
 robot = Supervisor()
@@ -19,6 +20,9 @@ frequency = 0      # Oscillations per second
 
 while robot.step(timestep) != -1:
     # Get the current simulation time
+    if os.path.exists("../clip_detector_lcp/reset_flag.txt"):
+        ball_node.setVelocity([0, 0, 0, 0, 0, 0])
+        continue
     t = robot.getTime()
     
     # Calculate lateral velocity (derivative of position)

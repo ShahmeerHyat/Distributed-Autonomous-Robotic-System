@@ -39,6 +39,28 @@ from distributedSystem.shared_utils import (
 # ─────────────────────────────────────────────────────────────────────────────
 PREFLIGHT_PINGS    = 8
 PROBE_FAIL_LATENCY = 999.0
+DEBUG_PRINT_EVERY  = 10   # print allocation table every N inference calls
+
+
+def _print_split_table(inference_num, block_devices, block_shares, num_heads,
+                       mlp_dim, total_latency):
+    """Print a compact allocation + latency table to the Webots console."""
+    n_blocks = 12   # ViT-B/32 has 12 transformer blocks
+    sep = "─" * 72
+    print(f"\n{sep}")
+    print(f"  [Master] Inference #{inference_num}  —  {len(block_devices)} device(s) active")
+    print(f"  {'Device':<12}  {'Share':>6}  {'Heads':>13}  {'MLP neurons':>22}  {'Latency':>9}")
+    print(f"  {'──────':<12}  {'──────':>6}  {'─────────────':>13}  {'──────────────────────':>22}  {'─────────':>9}")
+    for dev in block_devices:
+        share   = block_shares.get(dev, 0.0)
+        h       = indices_from_shares(block_devices, block_shares, dev, num_heads)
+        n       = indices_from_shares(block_devices, block_shares, dev, mlp_dim)
+        h_str   = f"{h.start}-{h.stop-1} ({len(h)}/{num_heads})" if h else "—"
+        n_str   = f"{n.start}-{n.stop-1} ({len(n)}/{mlp_dim})" if n else "—"
+        lat_ms  = total_latency.get(dev, 0.0) * 1000 / n_blocks
+        lat_str = f"{lat_ms:.1f}ms/blk"
+        print(f"  {dev:<12}  {share:>5.1%}  {h_str:>13}  {n_str:>22}  {lat_str:>9}")
+    print(sep + "\n")
 
 
 class MasterOrchestrator:
@@ -62,6 +84,7 @@ class MasterOrchestrator:
         self.all_devices: list = ["edge"]
         self.arima        = MultiDeviceARIMAManager(["edge"])
         self.last_inference_stats: dict = {}
+        self._inference_count = 0
 
         # Large pool — one future per worker per block, so headroom matters.
         self.executor = ThreadPoolExecutor(max_workers=64)
@@ -264,6 +287,12 @@ class MasterOrchestrator:
         S  = self.meta["seq_length"]
         D  = self.meta["embed_dim"]
 
+        self._inference_count += 1
+        should_print   = (self._inference_count % DEBUG_PRINT_EVERY == 0)
+        total_latency  = {}   # accumulated across all 12 blocks for the summary
+        snap0_devices  = None # block-0 snapshot for the summary table
+        snap0_shares   = None
+
         current_state = x
 
         for i, block in enumerate(self.model.encoder.layers):
@@ -283,6 +312,10 @@ class MasterOrchestrator:
             active_workers = [d for d in block_devices if d != "edge"]
             raw_latency    = {d: 0.0 for d in block_devices}
             share_used     = {d: 0.0 for d in block_devices}
+
+            if i == 0:
+                snap0_devices = block_devices
+                snap0_shares  = block_shares
 
             ln_1 = block.layer_norm1
             ln_2 = block.layer_norm2
@@ -416,6 +449,20 @@ class MasterOrchestrator:
                         self.arima.notify_probe_result(w, lat / s)
                     else:
                         self.arima.notify_probe_result(w, PROBE_FAIL_LATENCY)
+
+            # ── Accumulate latency for the debug summary ──────────────────
+            if should_print:
+                for dev in block_devices:
+                    total_latency[dev] = total_latency.get(dev, 0.0) + raw_latency.get(dev, 0.0)
+
+        # ── Per-N-inference allocation + latency summary ──────────────────────
+        if should_print and snap0_devices and len(snap0_devices) > 1:
+            _print_split_table(
+                self._inference_count,
+                snap0_devices, snap0_shares,
+                H, self.meta["mlp_hidden_dim"],
+                total_latency,
+            )
 
         return current_state
 

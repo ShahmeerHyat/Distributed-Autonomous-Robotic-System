@@ -112,6 +112,13 @@ class CLIPWorker:
 
 def _serve(worker: CLIPWorker, sock: socket.socket):
     """Process tasks from the master until the connection drops."""
+    inference_id   = 0
+    attn_times_ms  = []   # per-block ATTN latency for current inference
+    mlp_times_ms   = []   # per-block MLP  latency for current inference
+    # Snapshot of head/neuron assignment taken at block 0 (same for all blocks).
+    inf_heads_info   = ""
+    inf_neurons_info = ""
+
     while True:
         msg = recv_msg(sock)
         if msg is None:
@@ -129,12 +136,51 @@ def _serve(worker: CLIPWorker, sock: socket.socket):
 
         elif task == "ATTN":
             _, block_idx, (q, k, v) = msg
+
+            # New inference call starts at block 0.
+            if block_idx == 0:
+                # Print summary of the just-completed inference (if any).
+                if attn_times_ms:
+                    avg_attn = sum(attn_times_ms) / len(attn_times_ms)
+                    avg_mlp  = sum(mlp_times_ms)  / len(mlp_times_ms) if mlp_times_ms else 0.0
+                    print(f"  [Inference #{inference_id} summary]  "
+                          f"ATTN {avg_attn:.1f}ms/blk  MLP {avg_mlp:.1f}ms/blk  "
+                          f"({len(attn_times_ms)} blocks)")
+
+                inference_id  += 1
+                attn_times_ms  = []
+                mlp_times_ms   = []
+                n_heads_worker = q.shape[1]
+                total_heads    = worker.meta["num_heads"]
+                head_pct       = 100.0 * n_heads_worker / total_heads
+                inf_heads_info = (f"{n_heads_worker}/{total_heads} heads  "
+                                  f"({head_pct:.0f}%)  "
+                                  f"head_dim={q.shape[3]}  seq_len={q.shape[2]}")
+                print(f"\n[Inference #{inference_id}]  "
+                      f"ATTN → {inf_heads_info}")
+
+            t0     = time.time()
             result = worker.compute_attn_from_slices(block_idx, q, k, v)
+            elapsed_ms = (time.time() - t0) * 1000
+            attn_times_ms.append(elapsed_ms)
             send_msg(sock, result)
 
         elif task == "MLP":
             _, block_idx, x, start_idx, end_idx = msg
+
+            if block_idx == 0:
+                n_neurons    = end_idx - start_idx
+                total_neurons = worker.meta["mlp_hidden_dim"]
+                neuron_pct   = 100.0 * n_neurons / total_neurons
+                inf_neurons_info = (f"neurons {start_idx}–{end_idx-1}  "
+                                    f"({n_neurons}/{total_neurons},  {neuron_pct:.0f}%)")
+                print(f"[Inference #{inference_id}]  "
+                      f"MLP  → {inf_neurons_info}")
+
+            t0     = time.time()
             result = worker.compute_mlp_slice(block_idx, x, start_idx, end_idx)
+            elapsed_ms = (time.time() - t0) * 1000
+            mlp_times_ms.append(elapsed_ms)
             send_msg(sock, result)
 
         else:

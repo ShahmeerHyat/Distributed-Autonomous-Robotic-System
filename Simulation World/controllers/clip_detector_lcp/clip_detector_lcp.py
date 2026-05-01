@@ -10,18 +10,18 @@ Loosely Coupled Protocol version:
     measurement and begins distributing heads/neurons on the next inference call.
 """
 
-from controller import Robot
+from controller import Supervisor          
 import numpy as np
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from distributedSystem.master import MasterOrchestrator
-
+import os
 # ─────────────────────────────────────────────────────────────────────────────
 # Robot init
 # ─────────────────────────────────────────────────────────────────────────────
 
-robot    = Robot()
+robot    = Supervisor()
 timestep = int(robot.getBasicTimeStep())
 
 print("[INIT] Booting robot...")
@@ -39,8 +39,43 @@ right_motor.setPosition(float('inf'))
 
 MAX_SPEED = 6.28
 
+robot_node = robot.getSelf()
+ball_node  = robot.getFromDef("TENNIS_BALL")
+
+_robot_init_t = list(robot_node.getField("translation").getSFVec3f())
+_robot_init_r = list(robot_node.getField("rotation").getSFRotation())
+_ball_init_t  = list(ball_node.getField("translation").getSFVec3f())
+_ball_init_r  = list(ball_node.getField("rotation").getSFRotation())
+
 camera = robot.getDevice("camera")
 camera.enable(timestep)
+
+RESET_EVERY_N_FRAMES = 800  
+
+
+def reset_world():
+    left_motor.setVelocity(0.0)
+    right_motor.setVelocity(0.0)
+
+    # Signal ball controller to pause
+    open("reset_flag.txt", "w").close()
+
+    robot_node.getField("translation").setSFVec3f(_robot_init_t)
+    robot_node.getField("rotation").setSFRotation(_robot_init_r)
+    robot_node.resetPhysics()
+
+    ball_node.getField("translation").setSFVec3f(_ball_init_t)
+    ball_node.getField("rotation").setSFRotation(_ball_init_r)
+    ball_node.resetPhysics()
+
+    for _ in range(5):
+        robot.step(timestep)
+
+    # Clear the flag — ball controller resumes
+    if os.path.exists("reset_flag.txt"):
+        os.remove("reset_flag.txt")
+
+    print("[RESET] World reset complete.")
 
 print("[INIT] Devices ready.")
 
@@ -172,7 +207,16 @@ print("[RUN] Connect workers at any time: "
 while robot.step(timestep) != -1:
     step_count   += 1
     run_inference = (step_count % INFERENCE_EVERY_N == 0)
+    # ── Reset trigger ────────────────────────────────────────────────────
+    if step_count % RESET_EVERY_N_FRAMES == 0:
+        print(f"[RESET] Frame {step_count} — resetting world")
+        reset_world()
 
+        # Clear stale inference state so the robot doesn't carry over
+        # a confidence score or steering error from the previous episode
+        last_logits = 0.0
+        last_error  = 0.0
+        continue
     if run_inference:
         image = get_frame_as_pil(camera)
 
