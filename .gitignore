@@ -1,4 +1,8 @@
-*.pyc
+/yolo_venv/
 *.pt
+/runs
+/zeromq/
+/spvit_venv/
+__pycache__
+venv/
 /Clip Model
-/yolo_venv

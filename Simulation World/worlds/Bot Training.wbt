@@ -1,0 +1,89 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+
+WorldInfo {
+}
+Viewpoint {
+  orientation 0.004670519290634599 0.9981824333946379 -0.06008340795856281 0.1548294341024542
+  position -1.5091161027095736 -0.13873265132135115 -0.3751988321560638
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+  castShadows FALSE
+}
+RectangleArena {
+  translation -0.458228 -0.0935733 -0.58
+  rotation 0 0 1 4.6928e-06
+  floorSize 8 11
+}
+E-puck {
+  translation -0.729402 -0.00112018 -0.579147
+  rotation 0.0012559402260501917 0.0002502880450480519 0.9999991799846852 2.40428
+  controller "clip_detector_bm"
+  camera_fieldOfView 0.8
+  camera_width 480
+  camera_height 480
+}
+DEF TENNIS_BALL Robot {
+  translation -0.511586 0.119622 -0.540152
+  rotation 1 0 0 -1.3089953071795861
+  children [
+    Shape {
+      appearance Appearance {
+        material Material {
+          ambientIntensity 1
+          diffuseColor 1 1 1
+          emissiveColor 0.2 0.2 0.2
+        }
+        texture ImageTexture {
+          url [
+            "soccer_ball.jpg"
+          ]
+        }
+      }
+      geometry Sphere {
+        radius 0.04
+        subdivision 4
+      }
+      castShadows FALSE
+    }
+  ]
+  name "tennis_ball"
+  boundingObject Sphere {
+    radius 0.04
+  }
+  physics Physics {
+    density -1
+    mass 0.1
+  }
+  controller "ball_motion"
+  supervisor TRUE
+}
+DirectionalLight {
+  direction 0 -1 0
+  intensity 0.6
+}
+DirectionalLight {
+  direction 0 1 0
+  intensity 0.4
+}
+DirectionalLight {
+  direction 1 0 0
+  intensity 0.4
+}
+DirectionalLight {
+  direction -1 0 0
+  intensity 0.4
+}
+DirectionalLight {
+  direction 0 0 1
+  intensity 0.4
+}
+DirectionalLight {
+  intensity 0.4
+}
