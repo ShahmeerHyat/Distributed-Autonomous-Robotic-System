@@ -1,0 +1,68 @@
+SPViT Webots distributed inference — setup instructions
+=======================================================
+
+FILE LAYOUT (drop the vit_detector/ folder into Webots controllers/)
+---------------------------------------------------------------------
+vit_detector/
+├── vit_detector.py               ← Webots robot controller
+├── vit_model.py                  ← Clean ViT architecture (no dist.* calls)
+└── distributedSystem/
+    ├── master_vit.py             ← ViTMasterOrchestrator (runs inside Webots)
+    ├── worker_vit.py             ← Stateless worker (runs on your laptop)
+    ├── adaptive_split.py         ← Paper's adaptive_vit_inference_offloading (fixed)
+    ├── arima.py                  ← Paper's ARIMA.py (copied from Edge/)
+    └── shared_utils.py           ← Paper's socket protocol (pickle + 6-byte header)
+
+Everything follows the SPViT paper's design (Connect.py, AdaptiveSplit.py, ARIMA.py).
+No CLIP-detector components are used.
+
+
+RUNNING
+-------
+
+1. On your laptop (worker):
+
+   cd vit_detector/distributedSystem
+   python worker_vit.py --name laptop --master_ip <ip_of_webots_machine> --port 6688
+
+   Use --master_ip 127.0.0.1 if both are on the same machine.
+
+2. In Webots:
+
+   Set the robot controller to "vit_detector" and run the simulation.
+   The controller blocks until the worker connects, then starts inference.
+
+
+STANDALONE TEST (no Webots — pure math/latency verification)
+------------------------------------------------------------
+
+Terminal A (worker):
+   cd vit_detector/distributedSystem
+   python worker_vit.py --name laptop --master_ip 127.0.0.1 --port 6688
+
+Terminal B (master):
+   cd vit_detector/distributedSystem
+   python master_vit.py --port 6688
+
+Output per block:
+   block  0  heads[edge=4 | workers=4]  edge: 0.0021s  laptop: 0.0038s
+
+The ARIMA-based adaptive split will rebalance head/neuron assignments across
+blocks based on measured execution times and the paper's FLOPs formulas.
+
+
+CHECKPOINT
+----------
+Set CHECKPOINT in vit_detector.py:
+
+   CHECKPOINT = "/path/to/vit_cifar10.pth"
+
+state_dict must match vit_model.ViT with the VIT_CONFIG you set.
+If None, random weights are used (verifies shapes and algorithm, not accuracy).
+
+
+VIT CONFIG
+----------
+Default matches SPViT paper (CIFAR-10):
+   image_size=32, patch_size=4, num_classes=10
+   dim=512, depth=6, heads=8, mlp_dim=512, dim_head=64

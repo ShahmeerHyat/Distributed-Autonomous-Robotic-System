@@ -141,7 +141,7 @@ def compute_speeds(error: float):
 # ─────────────────────────────────────────────────────────────────────────────
 
 orch = MasterOrchestrator(
-    expected_workers = [],
+    expected_workers = ["pc_gpu"],
     host             = "0.0.0.0",
     port             = 29500,
     model            = model.vision_model,
