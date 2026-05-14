@@ -6,9 +6,21 @@ import socket
 
 PROBE_PAYLOAD_SHAPE = (1, 1, 1)  # tiny tensor, just for RTT
 
+def _to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu(x) for x in obj)
+    if isinstance(obj, list):
+        return [_to_cpu(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    return obj
+
+
 def send_msg(sock, msg):
     buffer = io.BytesIO()
-    torch.save(msg, buffer)
+    torch.save(_to_cpu(msg), buffer)
     data = buffer.getvalue()
     sock.sendall(struct.pack('>I', len(data)) + data)
 

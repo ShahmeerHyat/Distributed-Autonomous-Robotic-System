@@ -53,11 +53,13 @@ class MasterOrchestrator:
         self.breakers         = {w: CircuitBreaker() for w in expected_workers}
         self.last_inference_stats = {}
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         if model is not None:
-            self.model = model
+            self.model = model.to(self.device)
         else:
             clip       = CLIPModel.from_pretrained(MODEL_PATH, local_files_only=True).eval()
-            self.model = clip.vision_model
+            self.model = clip.vision_model.to(self.device)
 
         self.meta = meta or get_model_metadata(self.model)
 
@@ -131,7 +133,7 @@ class MasterOrchestrator:
         No tasks are dispatched to workers. Used exclusively during preflight
         to measure pure edge compute latency without network interference.
         """
-        current_state = x
+        current_state = x.to(self.device)
         H  = self.meta["num_heads"]
         hd = self.meta["head_dim"]
         S  = self.meta["seq_length"]
@@ -222,7 +224,7 @@ class MasterOrchestrator:
         x : (1, seq_length, embed_dim)  — output of vision.embeddings + pre_layrnorm
         Returns last hidden state (1, seq_length, embed_dim).
         """
-        current_state = x
+        current_state = x.to(self.device)
         H  = self.meta["num_heads"]
         hd = self.meta["head_dim"]
         S  = self.meta["seq_length"]

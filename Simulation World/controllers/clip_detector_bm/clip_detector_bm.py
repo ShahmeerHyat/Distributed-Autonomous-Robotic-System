@@ -136,6 +136,9 @@ orch = MasterOrchestrator(
     meta             = get_clip_metadata(model),
 )
 
+model.to(orch.device)
+_xs = _xs.to(orch.device)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BenchmarkCollector — created right after orch so it can access arima state
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +163,7 @@ bench.measure_comm_overhead()
 
 with torch.no_grad():
     text_inputs = processor(text=[SEARCH_PROMPT], return_tensors="pt", padding=True)
+    text_inputs = {k: v.to(orch.device) for k, v in text_inputs.items()}
     # Extract the hidden state of the EOT token
     text_outputs = model.text_model(**text_inputs)
     pooled_output = text_outputs.pooler_output 
@@ -197,7 +201,7 @@ while robot.step(timestep) != -1:
 
                 # Patch embedding (local, cheap)
                 img_inputs   = processor(images=image, return_tensors="pt")
-                pixel_values = img_inputs["pixel_values"]
+                pixel_values = img_inputs["pixel_values"].to(orch.device)
                 hidden = model.vision_model.embeddings(pixel_values)   # (1, 50, 768)
                 hidden = model.vision_model.pre_layrnorm(hidden)
 
