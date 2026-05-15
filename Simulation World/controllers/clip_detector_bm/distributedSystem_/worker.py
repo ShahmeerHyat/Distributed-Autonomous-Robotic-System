@@ -20,10 +20,8 @@ import argparse
 import socket
 from transformers import CLIPModel
 
-from splitInfer import MultiDeviceEvaluator
-from comms import send_msg, recv_msg, probe_rtt, ping_worker, CircuitBreaker
-from helper import get_model_metadata, to_head_space, sum_mlp_parts
-from helper import AttentionMeta, allocate_heads, split_heads, merge_heads
+from comms import send_msg, recv_msg
+from helper import get_model_metadata
 
 
 MODEL_PATH = r"Clip Model"
