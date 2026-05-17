@@ -1,17 +1,25 @@
 import io
+import pickle
 import struct
 import numpy as np
 import torch
 import time
 import socket
 
-PROBE_PAYLOAD_SHAPE = (1, 1, 1)  # tiny tensor, just for RTT
+PROBE_PAYLOAD_SHAPE = (1, 1, 1)
 
-# Magic prefixes to distinguish fast tensor path from pickle path.
-# Both master and worker use this module, so the protocol is symmetric.
-_MAGIC_TENSOR = b'\xfe\xed'
-_MAGIC_PICKLE = b'\xca\xfe'
+# Wire-format magic prefixes (2 bytes each).
+# Every payload on the socket is prefixed with one of these so recv_msg
+# knows how to deserialise without any out-of-band signalling.
+_MAGIC_TENSOR   = b'\xfe\xed'   # single raw tensor (fast path)
+_MAGIC_COMPOUND = b'\xba\xbe'   # skeleton + N raw tensors (fast path)
+_MAGIC_PICKLE   = b'\xca\xfe'   # pure-python / control message (fallback)
 
+# Sentinel used inside skeletons to mark where a tensor was extracted.
+_T = '__T__'
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _to_cpu(obj):
     if isinstance(obj, torch.Tensor):
@@ -25,25 +33,101 @@ def _to_cpu(obj):
     return obj
 
 
+def _any_tensor(obj) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return True
+    if isinstance(obj, (tuple, list)):
+        return any(_any_tensor(x) for x in obj)
+    if isinstance(obj, dict):
+        return any(_any_tensor(v) for v in obj.values())
+    return False
+
+
+def _strip(obj, bucket: list):
+    """Replace tensors with (_T, idx) sentinels; collect numpy arrays."""
+    if isinstance(obj, torch.Tensor):
+        idx = len(bucket)
+        bucket.append(obj.detach().cpu().contiguous().numpy())
+        return (_T, idx)
+    if isinstance(obj, tuple):
+        return tuple(_strip(x, bucket) for x in obj)
+    if isinstance(obj, list):
+        return [_strip(x, bucket) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _strip(v, bucket) for k, v in obj.items()}
+    return obj
+
+
+def _restore(obj, tensors: list):
+    if isinstance(obj, tuple):
+        if len(obj) == 2 and obj[0] == _T:
+            return tensors[obj[1]]
+        return tuple(_restore(x, tensors) for x in obj)
+    if isinstance(obj, list):
+        return [_restore(x, tensors) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _restore(v, tensors) for k, v in obj.items()}
+    return obj
+
+
+def _encode_arr(arr: np.ndarray) -> bytes:
+    """Encode a numpy array as: [ndim][dlen][shape…][dtype][data]."""
+    dtype_b = arr.dtype.str.encode()
+    return (
+        struct.pack('>BB', arr.ndim, len(dtype_b))
+        + struct.pack(f'>{arr.ndim}Q', *arr.shape)
+        + dtype_b
+        + arr.tobytes()
+    )
+
+
+def _decode_arr(data: bytes) -> torch.Tensor:
+    ndim, dlen = struct.unpack('>BB', data[:2])
+    shape  = struct.unpack(f'>{ndim}Q', data[2:2 + ndim * 8])
+    offset = 2 + ndim * 8
+    dtype  = data[offset:offset + dlen].decode()
+    raw    = data[offset + dlen:]
+    return torch.from_numpy(
+        np.frombuffer(raw, dtype=np.dtype(dtype)).reshape(shape).copy()
+    )
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def send_msg(sock, msg):
     """
-    Pure tensors use a raw-bytes fast path (~10× faster than pickle for small
-    tensors). Everything else (tuples, dicts, control messages) uses torch.save.
+    Three paths, in priority order:
+
+    1. Pure tensor  → _MAGIC_TENSOR  + raw numpy bytes   (~0.05 ms)
+    2. Container with tensors → _MAGIC_COMPOUND:
+         pickle skeleton (tensors stripped out, ~100 B)
+         + N × raw tensor blocks                         (~0.15 ms per tensor)
+    3. Pure-Python control message → _MAGIC_PICKLE + torch.save fallback
     """
     if isinstance(msg, torch.Tensor):
         arr     = msg.detach().cpu().contiguous().numpy()
-        dtype_b = arr.dtype.str.encode()          # e.g. b'<f2' for float16
-        ndim    = arr.ndim
+        dtype_b = arr.dtype.str.encode()
         payload = (
             _MAGIC_TENSOR
-            + struct.pack('>BB', ndim, len(dtype_b))
-            + struct.pack(f'>{ndim}Q', *arr.shape)
+            + struct.pack('>BB', arr.ndim, len(dtype_b))
+            + struct.pack(f'>{arr.ndim}Q', *arr.shape)
             + dtype_b
             + arr.tobytes()
         )
+
+    elif _any_tensor(msg):
+        bucket   = []
+        skeleton = _strip(msg, bucket)
+        skel_b   = pickle.dumps(skeleton, protocol=4)
+        parts    = [_MAGIC_COMPOUND, struct.pack('>I', len(skel_b)), skel_b]
+        for arr in bucket:
+            enc = _encode_arr(arr)
+            parts.append(struct.pack('>I', len(enc)) + enc)
+        payload = b''.join(parts)
+
     else:
         buf = io.BytesIO()
-        torch.save(_to_cpu(msg), buf)
+        torch.save(msg, buf)
         payload = _MAGIC_PICKLE + buf.getvalue()
 
     sock.sendall(struct.pack('>I', len(payload)) + payload)
@@ -63,26 +147,34 @@ def recv_msg(sock):
     raw_len = recvall(sock, 4)
     if not raw_len:
         return None
-    msglen = struct.unpack('>I', raw_len)[0]
-    data   = recvall(sock, msglen)
+    data  = recvall(sock, struct.unpack('>I', raw_len)[0])
+    magic = data[:2]
 
-    if data[:2] == _MAGIC_TENSOR:
-        ndim, dlen = struct.unpack('>BB', data[2:4])
-        shape      = struct.unpack(f'>{ndim}Q', data[4:4 + ndim * 8])
-        offset     = 4 + ndim * 8
-        dtype_str  = data[offset:offset + dlen].decode()
-        raw        = data[offset + dlen:]
-        arr        = np.frombuffer(raw, dtype=np.dtype(dtype_str)).reshape(shape)
-        return torch.from_numpy(arr.copy())
-    else:
-        return torch.load(io.BytesIO(data[2:]), weights_only=False)
+    if magic == _MAGIC_TENSOR:
+        return _decode_arr(data[2:])
 
+    if magic == _MAGIC_COMPOUND:
+        skel_len = struct.unpack('>I', data[2:6])[0]
+        skeleton = pickle.loads(data[6:6 + skel_len])
+        offset   = 6 + skel_len
+        tensors  = []
+        while offset < len(data):
+            t_len = struct.unpack('>I', data[offset:offset + 4])[0]
+            offset += 4
+            tensors.append(_decode_arr(data[offset:offset + t_len]))
+            offset += t_len
+        return _restore(skeleton, tensors)
+
+    # _MAGIC_PICKLE — control messages (QUIT, REGISTER, probe acks, …)
+    return torch.load(io.BytesIO(data[2:]), weights_only=False)
+
+
+# ── RTT probing ───────────────────────────────────────────────────────────────
 
 def probe_rtt(host: str, port: int, timeout: float = 2.0) -> float | None:
     """
     Opens a short-lived connection, sends a minimal ping tensor,
     waits for echo. Returns RTT in seconds or None if unreachable.
-    Kept separate from inference socket — pure network signal, no compute noise.
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -91,16 +183,13 @@ def probe_rtt(host: str, port: int, timeout: float = 2.0) -> float | None:
 
         payload = {"type": "probe", "tensor": torch.zeros(PROBE_PAYLOAD_SHAPE)}
 
-        t0 = time.perf_counter()
+        t0       = time.perf_counter()
         send_msg(sock, payload)
         response = recv_msg(sock)
-        rtt = time.perf_counter() - t0
+        rtt      = time.perf_counter() - t0
 
         sock.close()
-
-        if response and response.get("type") == "probe_ack":
-            return rtt
-        return None
+        return rtt if (response and response.get("type") == "probe_ack") else None
 
     except (socket.timeout, ConnectionRefusedError, OSError):
         return None
@@ -110,25 +199,26 @@ def ping_worker(sock, load: bool = False, timeout: float = 2.0) -> float | None:
     """
     Sends a lightweight ping over an existing connected socket.
     Returns RTT in seconds or None on failure.
-    Pure network signal — worker echoes immediately without compute.
     """
     try:
         sock.settimeout(timeout)
-        payload = {"type": "probe", "tensor": torch.zeros(PROBE_PAYLOAD_SHAPE)} if load else {"type": "probe"}
+        payload = (
+            {"type": "probe", "tensor": torch.zeros(PROBE_PAYLOAD_SHAPE)}
+            if load else {"type": "probe"}
+        )
 
-        t0 = time.perf_counter()
+        t0       = time.perf_counter()
         send_msg(sock, payload)
-
         response = recv_msg(sock)
-        rtt = time.perf_counter() - t0
+        rtt      = time.perf_counter() - t0
 
-        if response and response.get("type") == "probe_ack":
-            return rtt
-        return None
+        return rtt if (response and response.get("type") == "probe_ack") else None
 
     except (socket.timeout, OSError):
         return None
 
+
+# ── Circuit breaker ───────────────────────────────────────────────────────────
 
 class CircuitBreaker:
     CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
