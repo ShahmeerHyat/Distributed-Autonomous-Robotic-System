@@ -23,11 +23,11 @@ from transformers import CLIPModel
 # Relative imports when used as a package; bare imports when run standalone.
 try:
     from .splitInfer import MultiDeviceEvaluator
-    from .comms import send_msg, recv_msg, probe_rtt, CircuitBreaker
+    from .comms import send_msg, recv_msg, probe_rtt, ping_worker, CircuitBreaker
     from .helper import get_model_metadata, to_head_space, sum_mlp_parts, allocate_heads
 except ImportError:
     from splitInfer import MultiDeviceEvaluator
-    from comms import send_msg, recv_msg, probe_rtt, CircuitBreaker
+    from comms import send_msg, recv_msg, probe_rtt, ping_worker, CircuitBreaker
     from helper import get_model_metadata, to_head_space, sum_mlp_parts, allocate_heads
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,11 +101,11 @@ class MasterOrchestrator:
         print("[Master] Pre-flight RTT probing …")
 
         for w_name in self.expected_workers:
-            host, port = self.worker_addrs[w_name]
+            sock = self.sockets[w_name]
             rtts = []
 
             for _ in range(PREFLIGHT_PINGS):
-                rtt = probe_rtt(host, port)
+                rtt = ping_worker(sock)
                 rtts.append(rtt if rtt is not None else PROBE_FAIL_LATENCY)
 
             median_rtt = sorted(rtts)[len(rtts) // 2]
