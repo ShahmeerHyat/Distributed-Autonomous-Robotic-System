@@ -46,7 +46,7 @@ def recv_msg(sock):
         return None
     msglen = struct.unpack('>I', raw_len)[0]
     data   = recvall(sock, msglen)
-    return torch.load(io.BytesIO(data), weights_only=False)
+    return torch.load(io.BytesIO(data), weights_only=False, map_location='cpu')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
