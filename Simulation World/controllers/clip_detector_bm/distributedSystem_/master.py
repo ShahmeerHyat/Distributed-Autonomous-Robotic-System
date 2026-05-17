@@ -320,7 +320,7 @@ class MasterOrchestrator:
                     compute_time[dev] += comp_t
 
                     if res is not None and res.numel() > 0:
-                        head_parts.append(res.to(ln_x.device.float()))
+                        head_parts.append(res.to(dtype=torch.float32, device=ln_x.device))
                     else:
                         n = len(h_ranges[dev])
                         if n > 0:
@@ -376,7 +376,7 @@ class MasterOrchestrator:
                 network_time[w_name] += net_t
                 compute_time[w_name] += comp_t
                 if res is not None and res.numel() > 0:
-                    mlp_parts.append(res.to(ln_x_mlp.device.float()))
+                    mlp_parts.append(res.float().to(ln_x_mlp.device))
                 else:
                     self.breakers[w_name].trip(reason="mlp dispatch returned None")
 
