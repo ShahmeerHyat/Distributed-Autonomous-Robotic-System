@@ -70,7 +70,7 @@ class CLIPWorker:
             attn_probs = torch.nn.functional.softmax(
                 (q @ k.transpose(-2, -1)) * scale, dim=-1
             )
-            return (attn_probs @ v).cpu()
+            return (attn_probs @ v).cpu().half()
 
     def compute_mlp_slice(
         self,
@@ -96,13 +96,14 @@ class CLIPWorker:
             act_fn = mlp.activation_fn          # matches master — correct quick_gelu
 
             hidden = act_fn(x @ w1.t() + b1)   # (B, S, slice)
-            return (hidden @ w2.t()).cpu()       # (B, S, embed_dim)
+            return (hidden @ w2.t()).cpu().half() # (B, S, embed_dim)
 
 
 def run_worker_client(name: str, master_ip: str, port: int, use_gpu: bool):
     worker = CLIPWorker(use_gpu=use_gpu)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     print(f"[Worker] Connecting to master at {master_ip}:{port} …")
     sock.connect((master_ip, port))
 

@@ -86,6 +86,7 @@ class MasterOrchestrator:
 
         while len(self.sockets) < len(self.expected_workers):
             conn, addr = srv.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             msg = recv_msg(conn)
             if msg and msg[0] == "REGISTER":
                 name = msg[1]
@@ -114,6 +115,8 @@ class MasterOrchestrator:
             for rtt in rtts:
                 if rtt < PROBE_FAIL_LATENCY:
                     self.evaluator.record_step(w_name, latency=rtt, compute_time=0.0)
+
+            sock.settimeout(None)  # restore blocking mode after preflight pings
 
             if median_rtt >= PROBE_FAIL_LATENCY:
                 self.breakers[w_name].trip(reason="pre-flight unreachable")
