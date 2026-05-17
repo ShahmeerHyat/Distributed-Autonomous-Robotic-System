@@ -293,7 +293,7 @@ class MasterOrchestrator:
                 v_s = to_head_space(v_full, h_range, H, hd)
                 attn_futures[w_name] = self.executor.submit(
                     self._dispatch_task,
-                    w_name, "ATTN", i, (q_s, k_s, v_s),
+                    w_name, "ATTN", i, (q_s.half(), k_s.half(), v_s.half()),
                 )
 
             # Edge computes locally while workers are running.
@@ -320,7 +320,7 @@ class MasterOrchestrator:
                     compute_time[dev] += comp_t
 
                     if res is not None and res.numel() > 0:
-                        head_parts.append(res.to(ln_x.device))
+                        head_parts.append(res.to(ln_x.device.float()))
                     else:
                         n = len(h_ranges[dev])
                         if n > 0:
@@ -351,12 +351,12 @@ class MasterOrchestrator:
             mlp_futures = {}
             for w_name in self.expected_workers:
                 n_range = mlp_ranges[w_name]
-                if len(n_range) == 0:
+                if len(n_range) <= 64:
                     continue
                 mlp_futures[w_name] = self.executor.submit(
                     self._dispatch_task,
                     w_name, "MLP", i,
-                    ln_x_mlp, n_range.start, n_range.stop,
+                    ln_x_mlp.half(), n_range.start, n_range.stop,
                 )
 
             t0       = time.perf_counter()
@@ -376,7 +376,7 @@ class MasterOrchestrator:
                 network_time[w_name] += net_t
                 compute_time[w_name] += comp_t
                 if res is not None and res.numel() > 0:
-                    mlp_parts.append(res.to(ln_x_mlp.device))
+                    mlp_parts.append(res.to(ln_x_mlp.device.float()))
                 else:
                     self.breakers[w_name].trip(reason="mlp dispatch returned None")
 
@@ -385,11 +385,12 @@ class MasterOrchestrator:
 
             # ── Evaluator update ──────────────────────────────────────────────
             for dev in self.all_devices:
-                self.evaluator.record_step(
-                    dev,
-                    latency=network_time[dev],
-                    compute_time=compute_time[dev],
-                )
+                if dev == "edge" or compute_time[dev] > 0 or network_time[dev] > 0:
+                    self.evaluator.record_step(
+                        dev,
+                        latency=network_time[dev],
+                        compute_time=compute_time[dev],
+                    )
 
             # ── Circuit breaker feedback ───────────────────────────────────────
             for w_name in self.expected_workers:
@@ -400,10 +401,14 @@ class MasterOrchestrator:
                 if failed and cb.is_closed:
                     cb.trip(reason="dispatch failed")
                 elif self.evaluator.needs_probe(w_name) and cb.is_closed:
-                    cb.trip(reason="link score degraded")
+                    # Only trip if worker actually participated this block.
+                    # If it had zero allocation, needs_probe is meaningless.
+                    if network_time[w_name] > 0 or compute_time[w_name] > 0:
+                        cb.trip(reason="link score degraded")
                 elif cb.is_half_open:
                     if not failed:
                         cb.on_probe_success()
+                        self.evaluator.reset_latency(w_name)
                     else:
                         cb.on_probe_failure(reason="still unreachable")
 

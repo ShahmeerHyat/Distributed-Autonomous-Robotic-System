@@ -28,7 +28,16 @@ class MultiDeviceEvaluator:
             d["compute_ema"] = compute_time  # cold start
         else:
             d["compute_ema"] = (1 - ALPHA) * d["compute_ema"] + ALPHA * compute_time
-
+    
+    def reset_latency(self, device: str):
+        """
+        Called after a successful CB probe. Resets the AIMD latency score
+        to neutral (1.0) so stale near-zero values from the OPEN period
+        don't immediately retrigger needs_probe on the next block.
+        """
+        if device in self.devices:
+            self.devices[device]["latency_aimd"] = 1.0
+    
     def _update_latency_aimd(self, device: str, latency: float):
         d        = self.devices[device]
         prev_ema = d["latency_aimd"]

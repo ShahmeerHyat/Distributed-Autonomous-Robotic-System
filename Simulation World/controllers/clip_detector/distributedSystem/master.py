@@ -249,7 +249,7 @@ class MasterOrchestrator:
                     res, lat = attn_futures[dev].result()   # (1, H_w, S, hd)
                     raw_latency[dev] += lat
                     if res is not None and res.numel() > 0:
-                        head_parts.append(res.to(ln_x.device))
+                        head_parts.append(res.to(ln_x.device.float))
                     else:
                         # Worker failed — fill with zeros to preserve shape
                         h_range = self.arima.get_indices(dev, H)

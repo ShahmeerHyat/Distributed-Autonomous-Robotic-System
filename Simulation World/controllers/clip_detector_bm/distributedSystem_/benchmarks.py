@@ -220,15 +220,15 @@ class BenchmarkCollector:
             N_w = alloc_mlp.get(w_name, 0)
 
             if H_w > 0:
-                q_s       = torch.zeros(1, H_w, S, hd)
+                q_s       = torch.zeros(1, H_w, S, hd).half()
                 sent_attn = _serialised_bytes((q_s, q_s.clone(), q_s.clone()))
-                recv_attn = _serialised_bytes(q_s)
+                recv_attn = _serialised_bytes(q_s.half())
                 total_bytes += (sent_attn + recv_attn) * num_blocks
 
             if N_w > 0:
-                ln_x     = torch.zeros(1, S, D)
+                ln_x     = torch.zeros(1, S, D).half()
                 sent_mlp = _serialised_bytes(ln_x)
-                recv_mlp = _serialised_bytes(torch.zeros(1, S, D))
+                recv_mlp = _serialised_bytes(torch.zeros(1, S, D).half())
                 total_bytes += (sent_mlp + recv_mlp) * num_blocks
 
         self._comm_bytes_per_frame = total_bytes

@@ -62,9 +62,9 @@ class CLIPWorker:
         Returns  : (B, H_slice, S, head_dim)
         """
         with torch.no_grad():
-            q = q.to(self.device)
-            k = k.to(self.device)
-            v = v.to(self.device)
+            q = q.to(self.device).float()
+            k = k.to(self.device).float()
+            v = v.to(self.device).float()
 
             scale      = self.meta["head_dim"] ** -0.5
             attn_probs = torch.nn.functional.softmax(
@@ -86,7 +86,7 @@ class CLIPWorker:
             return torch.tensor([])
 
         with torch.no_grad():
-            x     = x.to(self.device)
+            x     = x.to(self.device).float()
             block = self.vision.encoder.layers[block_idx]
             mlp   = block.mlp
 
