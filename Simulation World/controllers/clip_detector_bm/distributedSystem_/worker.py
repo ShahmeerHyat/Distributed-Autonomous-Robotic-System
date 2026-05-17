@@ -136,16 +136,16 @@ def run_worker_client(name: str, master_ip: str, port: int, use_gpu: bool):
                 _, block_idx, (q, k, v) = msg
                 result = worker.compute_attn_from_slices(block_idx, q, k, v)
                 send_msg(sock, result)
-                print(f"  ATTN  block={block_idx:2d}  "
-                      f"heads={q.shape[1]}  out={tuple(result.shape)}")
+                # print(f"  ATTN  block={block_idx:2d}  "
+                #       f"heads={q.shape[1]}  out={tuple(result.shape)}")
 
             # ── MLP ───────────────────────────────────────────────────────
             elif task == "MLP":
                 _, block_idx, x, start_idx, end_idx = msg
                 result = worker.compute_mlp_slice(block_idx, x, start_idx, end_idx)
                 send_msg(sock, result)
-                print(f"  MLP   block={block_idx:2d}  "
-                      f"neurons={start_idx}:{end_idx}  out={tuple(result.shape)}")
+                # print(f"  MLP   block={block_idx:2d}  "
+                #       f"neurons={start_idx}:{end_idx}  out={tuple(result.shape)}")
 
             else:
                 print(f"[Worker] Unknown task: {task!r}")

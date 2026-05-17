@@ -1,10 +1,17 @@
 import io
 import struct
+import numpy as np
 import torch
 import time
 import socket
 
 PROBE_PAYLOAD_SHAPE = (1, 1, 1)  # tiny tensor, just for RTT
+
+# Magic prefixes to distinguish fast tensor path from pickle path.
+# Both master and worker use this module, so the protocol is symmetric.
+_MAGIC_TENSOR = b'\xfe\xed'
+_MAGIC_PICKLE = b'\xca\xfe'
+
 
 def _to_cpu(obj):
     if isinstance(obj, torch.Tensor):
@@ -19,10 +26,27 @@ def _to_cpu(obj):
 
 
 def send_msg(sock, msg):
-    buffer = io.BytesIO()
-    torch.save(_to_cpu(msg), buffer)
-    data = buffer.getvalue()
-    sock.sendall(struct.pack('>I', len(data)) + data)
+    """
+    Pure tensors use a raw-bytes fast path (~10× faster than pickle for small
+    tensors). Everything else (tuples, dicts, control messages) uses torch.save.
+    """
+    if isinstance(msg, torch.Tensor):
+        arr     = msg.detach().cpu().contiguous().numpy()
+        dtype_b = arr.dtype.str.encode()          # e.g. b'<f2' for float16
+        ndim    = arr.ndim
+        payload = (
+            _MAGIC_TENSOR
+            + struct.pack('>BB', ndim, len(dtype_b))
+            + struct.pack(f'>{ndim}Q', *arr.shape)
+            + dtype_b
+            + arr.tobytes()
+        )
+    else:
+        buf = io.BytesIO()
+        torch.save(_to_cpu(msg), buf)
+        payload = _MAGIC_PICKLE + buf.getvalue()
+
+    sock.sendall(struct.pack('>I', len(payload)) + payload)
 
 
 def recvall(sock, n):
@@ -32,7 +56,7 @@ def recvall(sock, n):
         if not packet:
             return None
         data.extend(packet)
-    return data
+    return bytes(data)
 
 
 def recv_msg(sock):
@@ -41,7 +65,17 @@ def recv_msg(sock):
         return None
     msglen = struct.unpack('>I', raw_len)[0]
     data   = recvall(sock, msglen)
-    return torch.load(io.BytesIO(data), weights_only=False)
+
+    if data[:2] == _MAGIC_TENSOR:
+        ndim, dlen = struct.unpack('>BB', data[2:4])
+        shape      = struct.unpack(f'>{ndim}Q', data[4:4 + ndim * 8])
+        offset     = 4 + ndim * 8
+        dtype_str  = data[offset:offset + dlen].decode()
+        raw        = data[offset + dlen:]
+        arr        = np.frombuffer(raw, dtype=np.dtype(dtype_str)).reshape(shape)
+        return torch.from_numpy(arr.copy())
+    else:
+        return torch.load(io.BytesIO(data[2:]), weights_only=False)
 
 
 def probe_rtt(host: str, port: int, timeout: float = 2.0) -> float | None:
@@ -70,8 +104,9 @@ def probe_rtt(host: str, port: int, timeout: float = 2.0) -> float | None:
 
     except (socket.timeout, ConnectionRefusedError, OSError):
         return None
-    
-def ping_worker(sock, load: bool = False,timeout: float = 2.0) -> float | None:
+
+
+def ping_worker(sock, load: bool = False, timeout: float = 2.0) -> float | None:
     """
     Sends a lightweight ping over an existing connected socket.
     Returns RTT in seconds or None on failure.
@@ -93,6 +128,7 @@ def ping_worker(sock, load: bool = False,timeout: float = 2.0) -> float | None:
 
     except (socket.timeout, OSError):
         return None
+
 
 class CircuitBreaker:
     CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
