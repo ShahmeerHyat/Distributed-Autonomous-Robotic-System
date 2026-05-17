@@ -83,9 +83,9 @@ class CLIPWorker:
             block = self.vision.encoder.layers[block_idx]
             mlp   = block.mlp
 
-            w1     = mlp.fc1.weight[start_n:end_n, :]
-            b1     = mlp.fc1.bias[start_n:end_n]
-            w2     = mlp.fc2.weight[:, start_n:end_n]
+            w1     = mlp.fc1.weight[start_n:end_n, :].to(self.device)
+            b1     = mlp.fc1.bias[start_n:end_n].to(self.device)
+            w2     = mlp.fc2.weight[:, start_n:end_n].to(self.device)
             act_fn = mlp.activation_fn          # matches master — correct quick_gelu
 
             hidden = act_fn(x @ w1.t() + b1)   # (B, S, slice)
