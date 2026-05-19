@@ -16,6 +16,7 @@ import torch
 import argparse
 import socket
 from transformers import CLIPModel
+import time
 
 from shared_utils import recv_msg, send_msg, get_model_metadata
 
@@ -100,7 +101,15 @@ def run_worker_client(name: str, master_ip: str, port: int, use_gpu: bool):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     print(f"[Worker] Connecting to master at {master_ip}:{port} …")
-    sock.connect((master_ip, port))
+    
+    while True:
+        try:
+            sock.connect((master_ip, port))
+            break
+        except Exception as e:
+            print("Retrying in 2 Seconds")
+            time.sleep(2)
+            continue
 
     send_msg(sock, ("REGISTER", name))
     print(f"[Worker] Registered as '{name}'. Waiting for tasks …\n")
@@ -131,11 +140,13 @@ def run_worker_client(name: str, master_ip: str, port: int, use_gpu: bool):
                 _, block_idx, (q, k, v) = msg
                 result = worker.compute_attn_from_slices(block_idx, q, k, v)
                 send_msg(sock, result)
+                print("Recieved Attention Block: ", block_idx)
 
             elif task == "MLP":
                 _, block_idx, x, start_idx, end_idx = msg
                 result = worker.compute_mlp_slice(block_idx, x, start_idx, end_idx)
                 send_msg(sock, result)
+                print("Recieved MLP Block: ", block_idx , start_idx, ": ", end_idx)
 
             else:
                 print(f"[Worker] Unknown task: {task!r}")
