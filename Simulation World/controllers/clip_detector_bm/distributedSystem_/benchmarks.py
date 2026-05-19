@@ -45,9 +45,11 @@ import torch
 from collections import deque
  
 try:
-    from .shared_utils import allocate_heads, MultiDeviceARIMAManager
+    from .shared_utils import MultiDeviceARIMAManager
+    from .helper import allocate_heads
 except ImportError:
-    from shared_utils import allocate_heads, MultiDeviceARIMAManager
+    from helper import allocate_heads
+    from shared_utils import MultiDeviceARIMAManager
  
  
 # ─────────────────────────────────────────────────────────────────────────────
