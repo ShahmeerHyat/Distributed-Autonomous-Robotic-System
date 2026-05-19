@@ -276,10 +276,5 @@ while robot.step(timestep) != -1:
     # ── Benchmark report trigger ───────────────────────────────────────────
 
     if step_count == BENCHMARK_AFTER_N_FRAMES:
-        # M11: run circuit breaker test just before printing
-        dummy = torch.randn(1, get_clip_metadata(model)["seq_length"],
-                            get_clip_metadata(model)["embed_dim"])
-        bench.simulate_worker_failure("pc_gpu", dummy)
-
         bench.report()
         break

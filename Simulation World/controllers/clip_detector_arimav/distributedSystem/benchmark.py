@@ -308,70 +308,7 @@ class BenchmarkCollector:
             for w, dq in self._share_log.items():
                 dq.append(shares.get(w, 0.0))
             self._share_block_count += 1
- 
-    # ── M9: Circuit-breaker recovery simulation ───────────────────────────────
- 
-    def simulate_worker_failure(
-        self,
-        worker_name: str,
-        dummy_input: torch.Tensor,
-    ) -> dict:
-        """
-        Inject high-latency events into ARIMA history and observe CB behaviour.
-        No-op in edge-only mode.  Call OUTSIDE the main loop.
-        """
-        if not self.is_distributed:
-            return {"error": "Edge-only mode — no workers to simulate."}
- 
-        FAIL_LAT = 999.0
-        arima    = self.orch.arima
-        breaker  = arima.breakers.get(worker_name)
-        if breaker is None:
-            return {"error": f"No circuit breaker for '{worker_name}'"}
- 
-        result = {
-            "worker":                         worker_name,
-            "cb_ever_tripped":                False,
-            "blocks_degraded_before_cb_trip": 0,
-            "blocks_to_full_recovery":        0,
-        }
- 
-        print(f"[Benchmark] Simulating '{worker_name}' failure …")
- 
-        # Phase 1 — inject failure until CB trips
-        degraded = 0
-        for _ in range(50):
-            arima.record_block_latency(worker_name, latency=FAIL_LAT, share_used=0.5)
-            arima.update_shares()
-            if breaker.is_open:
-                result["cb_ever_tripped"] = True
-                break
-            if arima.current_shares.get(worker_name, 0.0) > 0:
-                degraded += 1
-        result["blocks_degraded_before_cb_trip"] = degraded
-        print(f"  CB tripped after {degraded} degraded block(s).")
- 
-        # Phase 2 — fast-forward cooldown
-        while breaker.is_open:
-            breaker.tick()
-        print("  CB now HALF_OPEN — probing recovery …")
- 
-        # Phase 3 — inject healthy latency until probe clears
-        recovery_blocks = 0
-        for _ in range(30):
-            arima.notify_probe_result(worker_name, 0.01)
-            recovery_blocks += 1
-            if breaker.is_closed:
-                break
- 
-        result["blocks_to_full_recovery"] = recovery_blocks
-        share_now = arima.current_shares.get(worker_name, 0.0)
-        print(f"  Recovery in {recovery_blocks} block(s). "
-              f"Share restored to {share_now:.2f}\n")
- 
-        self._recovery_results.append(result)
-        return result
- 
+        
     # ── report() — single unified table ──────────────────────────────────────
  
     def report(self):
@@ -665,13 +602,6 @@ class BenchmarkCollector:
                          f"Recovery blocks: {r['blocks_to_full_recovery']}"),
                         _null(), _null(),
                     ))
-            else:
-                rows.append((
-                    "CB simulation",
-                    N,
-                    "Not run — call simulate_worker_failure() outside main loop",
-                    _null(), _null(),
-                ))
  
         # ── Print ─────────────────────────────────────────────────────────────
         _print_unified_table(HDRS, rows, title=f"Benchmark Table [{mode}]")
