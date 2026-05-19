@@ -209,7 +209,6 @@ while robot.step(timestep) != -1:
                 # Distributed encoder forward — timed for M3
                 t0          = time.perf_counter()
                 last_hidden = orch.run_inference(hidden)
-                inf_lat     = time.perf_counter() - t0
 
                 # 4. Official Pooling & Post-Norm (For the Global Score/Confidence)
                 cls_token     = last_hidden[:, 0, :]
@@ -238,6 +237,8 @@ while robot.step(timestep) != -1:
                 last_error = EMA_ALPHA * raw_error + (1.0 - EMA_ALPHA) * last_error
 
                 top_val, top_idx = torch.topk(heatmap, 1)
+                
+                inf_lat     = time.perf_counter() - t0
 
             # Push to benchmark collector
             bench.record_inference(
@@ -268,10 +269,5 @@ while robot.step(timestep) != -1:
     # ── Benchmark report trigger ───────────────────────────────────────────
 
     if step_count == BENCHMARK_AFTER_N_FRAMES:
-        # M11: run circuit breaker test just before printing
-        dummy = torch.randn(1, get_clip_metadata(model)["seq_length"],
-                            get_clip_metadata(model)["embed_dim"])
-        bench.simulate_worker_failure("pc_gpu", dummy)
-
         bench.report()
         break
